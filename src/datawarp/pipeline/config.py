@@ -9,15 +9,31 @@ class SheetMapping:
     """Mapping from Excel sheet to database table"""
     sheet_pattern: str              # Sheet name or regex pattern
     table_name: str                 # Target table: "tbl_adhd_icb"
+    table_description: str = ""     # "ADHD referrals by ICB"
     column_mappings: Dict[str, str] = field(default_factory=dict)  # source -> canonical
+    column_descriptions: Dict[str, str] = field(default_factory=dict)  # canonical -> description
     column_types: Dict[str, str] = field(default_factory=dict)     # canonical -> pg_type
+    grain: str = "unknown"          # "icb", "trust", "national", "unknown"
+    grain_column: Optional[str] = None  # which column has the entity
+    grain_description: str = ""     # "ICB level data"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'SheetMapping':
-        return cls(**data)
+        # Handle older configs without new fields
+        return cls(
+            sheet_pattern=data.get('sheet_pattern', ''),
+            table_name=data.get('table_name', ''),
+            table_description=data.get('table_description', ''),
+            column_mappings=data.get('column_mappings', {}),
+            column_descriptions=data.get('column_descriptions', {}),
+            column_types=data.get('column_types', {}),
+            grain=data.get('grain', 'unknown'),
+            grain_column=data.get('grain_column'),
+            grain_description=data.get('grain_description', ''),
+        )
 
 
 @dataclass

@@ -6,3 +6,4 @@ beautifulsoup4>=4.12
 rich>=13.0
 python-dotenv>=1.0
 click>=8.0
+litellm>=1.0

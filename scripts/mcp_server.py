@@ -25,15 +25,24 @@ from datawarp.pipeline import list_configs, load_config
 
 def list_datasets(schema: str = 'staging') -> List[Dict]:
     """
-    List all available datasets with descriptions.
+    List all available datasets with descriptions from saved configs.
 
     Returns list of tables with:
         - name: table name
-        - description: inferred description
+        - description: from LLM enrichment or heuristic
+        - grain: entity level (icb, trust, national)
         - row_count: number of rows
-        - periods: list of available periods (if period column exists)
+        - periods: list of available periods
     """
     results = []
+
+    # Build mapping from saved configs
+    configs = list_configs()
+    config_map = {}  # table_name -> SheetMapping
+    for cfg in configs:
+        for fp in cfg.file_patterns:
+            for sm in fp.sheet_mappings:
+                config_map[sm.table_name] = sm
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -62,12 +71,22 @@ def list_datasets(schema: str = 'staging') -> List[Dict]:
                     cur.execute(f"SELECT DISTINCT period FROM {schema}.{table} ORDER BY period")
                     periods = [row[0] for row in cur.fetchall()]
 
-                # Generate description from table name
-                desc = _infer_table_description(table)
+                # Get description from config or infer
+                if table in config_map:
+                    sm = config_map[table]
+                    desc = sm.table_description or _infer_table_description(table)
+                    grain = sm.grain
+                    grain_desc = sm.grain_description
+                else:
+                    desc = _infer_table_description(table)
+                    grain = 'unknown'
+                    grain_desc = ''
 
                 results.append({
                     'name': table,
                     'description': desc,
+                    'grain': grain,
+                    'grain_description': grain_desc,
                     'row_count': row_count,
                     'periods': periods,
                 })
@@ -79,12 +98,41 @@ def get_schema(table_name: str, schema: str = 'staging') -> Dict:
     """
     Get detailed schema information for a table.
 
+    Uses saved column descriptions from LLM enrichment if available.
+
     Returns:
         - table_name
+        - description
+        - grain
         - columns: list of {name, type, description, sample_values}
         - row_count
     """
-    return get_table_metadata(table_name, schema)
+    # Find config for this table
+    configs = list_configs()
+    sheet_mapping = None
+    for cfg in configs:
+        for fp in cfg.file_patterns:
+            for sm in fp.sheet_mappings:
+                if sm.table_name == table_name:
+                    sheet_mapping = sm
+                    break
+
+    # Get base metadata
+    metadata = get_table_metadata(table_name, schema)
+
+    # Enhance with config descriptions
+    if sheet_mapping:
+        metadata['description'] = sheet_mapping.table_description or metadata.get('description', '')
+        metadata['grain'] = sheet_mapping.grain
+        metadata['grain_description'] = sheet_mapping.grain_description
+
+        # Add enriched column descriptions
+        for col in metadata.get('columns', []):
+            col_name = col['name']
+            if col_name in sheet_mapping.column_descriptions:
+                col['description'] = sheet_mapping.column_descriptions[col_name]
+
+    return metadata
 
 
 def query(sql: str, limit: int = 1000) -> Dict:

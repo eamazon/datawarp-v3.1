@@ -32,6 +32,7 @@ from datawarp.pipeline import (
 )
 from datawarp.utils import parse_period, extract_periods_from_files, sanitize_name, make_table_name
 from datawarp.storage import get_connection
+from datawarp.metadata import detect_grain, enrich_sheet
 
 console = Console()
 
@@ -46,12 +47,16 @@ def cli():
 @click.option('--url', required=True, help='NHS publication landing page URL')
 @click.option('--name', help='Pipeline name (auto-generated if not provided)')
 @click.option('--id', 'pipeline_id', help='Pipeline ID (auto-generated if not provided)')
-def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str]):
+@click.option('--enrich', is_flag=True, help='Use LLM to generate semantic column names')
+@click.option('--skip-unknown', is_flag=True, default=True, help='Skip sheets with no detected entity')
+def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich: bool, skip_unknown: bool):
     """
     Bootstrap a new pipeline from an NHS URL.
 
     Discovers files, groups by period, lets you select what to load,
     then saves the pattern for future scans.
+
+    Use --enrich to call LLM for semantic column names and descriptions.
     """
     console.print(f"\n[bold blue]Discovering files from:[/] {url}\n")
 
@@ -151,39 +156,93 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str]):
 
             # Load each selected sheet
             sheet_mappings = []
+            auto_name = name or _extract_name_from_url(url)
+            auto_id = pipeline_id or sanitize_name(auto_name)
+
             for sheet in selected_sheets:
                 console.print(f"\n  [bold]Loading sheet: {sheet}[/]")
 
-                # Preview
-                preview = preview_sheet(local_path, sheet)
-                console.print(f"  Columns: {', '.join(preview.columns[:5])}{'...' if len(preview.columns) > 5 else ''}")
-                console.print(f"  Preview rows: {len(preview)}")
+                # Preview and detect grain
+                import pandas as pd
+                try:
+                    preview = pd.read_excel(local_path, sheet_name=sheet, nrows=50)
+                except Exception as e:
+                    console.print(f"  [red]Error reading sheet: {e}[/]")
+                    continue
 
-                # Generate table name
-                auto_name = name or _extract_name_from_url(url)
-                auto_id = pipeline_id or sanitize_name(auto_name)
-                table_name = make_table_name(auto_id, sheet)
+                if preview.empty:
+                    console.print(f"  [dim]Skipping - empty sheet[/]")
+                    continue
 
+                # Detect grain (entity type)
+                grain_info = detect_grain(preview)
+                grain = grain_info['grain']
+                grain_col = grain_info['grain_column']
+                grain_desc = grain_info['description']
+
+                if skip_unknown and grain == 'unknown':
+                    console.print(f"  [dim]Skipping - no entity detected (probably notes/methodology)[/]")
+                    continue
+
+                console.print(f"  Grain: [cyan]{grain}[/] ({grain_desc})")
+                console.print(f"  Columns: {', '.join(str(c) for c in preview.columns[:5])}{'...' if len(preview.columns) > 5 else ''}")
+
+                # Prepare for enrichment
+                sanitized_cols = [sanitize_name(str(c)) for c in preview.columns if not str(c).lower().startswith('unnamed')]
+                sample_rows = preview.head(3).to_dict('records')
+
+                # Enrichment (optional)
+                if enrich:
+                    console.print(f"  [yellow]Enriching with LLM...[/]")
+                    enriched = enrich_sheet(
+                        sheet_name=sheet,
+                        columns=sanitized_cols,
+                        sample_rows=sample_rows,
+                        publication_hint=auto_id,
+                        grain_hint=grain
+                    )
+                    table_suffix = enriched['table_name']
+                    table_desc = enriched['table_description']
+                    col_mappings = enriched['columns']
+                    col_descriptions = enriched['descriptions']
+                    console.print(f"  [green]LLM suggested: {table_suffix}[/]")
+                else:
+                    table_suffix = sanitize_name(sheet)
+                    table_desc = f"Data from {sheet}"
+                    col_mappings = {c: c for c in sanitized_cols}
+                    col_descriptions = {}
+
+                table_name = f"tbl_{auto_id}_{table_suffix}"
                 console.print(f"  [dim]Table: staging.{table_name}[/]")
 
                 # Load data
                 with console.status("Loading to database..."):
-                    rows, col_mappings, col_types = load_sheet(
+                    rows, learned_mappings, col_types = load_sheet(
                         local_path, sheet, table_name,
-                        period=latest
+                        period=latest,
+                        column_mappings=col_mappings
                     )
+
+                if rows == 0:
+                    console.print(f"  [dim]Skipped (no data or sheet not found)[/]")
+                    continue
 
                 console.print(f"  [green]Loaded {rows} rows[/]")
 
                 # Record load
                 record_load(auto_id, latest, table_name, f.filename, sheet, rows)
 
-                # Save sheet mapping for future use
+                # Save sheet mapping with enriched data
                 sheet_mappings.append(SheetMapping(
                     sheet_pattern=sheet,
                     table_name=table_name,
-                    column_mappings=col_mappings,
+                    table_description=table_desc,
+                    column_mappings=learned_mappings,
+                    column_descriptions=col_descriptions,
                     column_types=col_types,
+                    grain=grain,
+                    grain_column=grain_col,
+                    grain_description=grain_desc,
                 ))
 
             # Create file pattern
@@ -195,14 +254,57 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str]):
 
         else:
             # CSV file
+            import pandas as pd
             auto_name = name or _extract_name_from_url(url)
             auto_id = pipeline_id or sanitize_name(auto_name)
-            table_name = make_table_name(auto_id, os.path.splitext(f.filename)[0])
+
+            # Read preview for grain detection
+            try:
+                preview = pd.read_csv(local_path, nrows=50)
+            except Exception as e:
+                console.print(f"  [red]Error reading CSV: {e}[/]")
+                continue
+
+            # Detect grain
+            grain_info = detect_grain(preview)
+            grain = grain_info['grain']
+            grain_col = grain_info['grain_column']
+            grain_desc = grain_info['description']
+
+            console.print(f"  Grain: [cyan]{grain}[/] ({grain_desc})")
+
+            # Prepare for enrichment
+            sanitized_cols = [sanitize_name(str(c)) for c in preview.columns if not str(c).lower().startswith('unnamed')]
+            sample_rows = preview.head(3).to_dict('records')
+
+            # Enrichment (optional)
+            if enrich:
+                console.print(f"  [yellow]Enriching with LLM...[/]")
+                enriched = enrich_sheet(
+                    sheet_name=os.path.splitext(f.filename)[0],
+                    columns=sanitized_cols,
+                    sample_rows=sample_rows,
+                    publication_hint=auto_id,
+                    grain_hint=grain
+                )
+                table_suffix = enriched['table_name']
+                table_desc = enriched['table_description']
+                col_mappings = enriched['columns']
+                col_descriptions = enriched['descriptions']
+                console.print(f"  [green]LLM suggested: {table_suffix}[/]")
+            else:
+                table_suffix = sanitize_name(os.path.splitext(f.filename)[0])
+                table_desc = f"Data from {f.filename}"
+                col_mappings = {c: c for c in sanitized_cols}
+                col_descriptions = {}
+
+            table_name = f"tbl_{auto_id}_{table_suffix}"
 
             with console.status("Loading to database..."):
-                rows, col_mappings, col_types = load_file(
+                rows, learned_mappings, col_types = load_file(
                     local_path, table_name,
-                    period=latest
+                    period=latest,
+                    column_mappings=col_mappings
                 )
 
             console.print(f"  [green]Loaded {rows} rows to staging.{table_name}[/]")
@@ -214,8 +316,13 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str]):
                 sheet_mappings=[SheetMapping(
                     sheet_pattern='',
                     table_name=table_name,
-                    column_mappings=col_mappings,
+                    table_description=table_desc,
+                    column_mappings=learned_mappings,
+                    column_descriptions=col_descriptions,
                     column_types=col_types,
+                    grain=grain,
+                    grain_column=grain_col,
+                    grain_description=grain_desc,
                 )],
             ))
 
