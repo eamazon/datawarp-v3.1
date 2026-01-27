@@ -13,25 +13,13 @@ load_dotenv()
 
 def get_connection_string() -> str:
     """Build connection string from environment variables."""
-    name = os.getenv('DB_NAME', 'datawalker')
-    user = os.getenv('DB_USER', '')
-    password = os.getenv('DB_PASSWORD', '')
-    host = os.getenv('DB_HOST', '')
-    port = os.getenv('DB_PORT', '')
+    host = os.getenv('POSTGRES_HOST', 'localhost')
+    port = os.getenv('POSTGRES_PORT', '5432')
+    name = os.getenv('POSTGRES_DB', 'datawalker')
+    user = os.getenv('POSTGRES_USER', 'databot')
+    password = os.getenv('POSTGRES_PASSWORD', '')
 
-    # Build connection string - only include non-empty values
-    # This allows unix socket auth when host is not specified
-    parts = [f"dbname={name}"]
-    if user:
-        parts.append(f"user={user}")
-    if password:
-        parts.append(f"password={password}")
-    if host:
-        parts.append(f"host={host}")
-    if port:
-        parts.append(f"port={port}")
-
-    return " ".join(parts)
+    return f"host={host} port={port} dbname={name} user={user} password={password}"
 
 
 @contextmanager
