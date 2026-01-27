@@ -25,7 +25,7 @@ from rich.panel import Panel
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from datawarp.discovery import scrape_landing_page, DiscoveredFile
-from datawarp.loader import load_sheet, download_file, get_sheet_names, preview_sheet
+from datawarp.loader import load_sheet, load_file, download_file, get_sheet_names, preview_sheet
 from datawarp.pipeline import (
     PipelineConfig, FilePattern, SheetMapping,
     save_config, load_config, list_configs, record_load, get_load_history
@@ -200,8 +200,8 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str]):
             table_name = make_table_name(auto_id, os.path.splitext(f.filename)[0])
 
             with console.status("Loading to database..."):
-                rows, col_mappings, col_types = load_sheet(
-                    local_path, None, table_name,
+                rows, col_mappings, col_types = load_file(
+                    local_path, table_name,
                     period=latest
                 )
 

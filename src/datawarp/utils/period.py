@@ -29,6 +29,8 @@ PERIOD_PATTERNS = [
     (r'(\d{4})[-_]([a-z]+)', lambda m: f"{m.group(1)}-{MONTHS.get(m.group(2).lower(), '00')}" if MONTHS.get(m.group(2).lower()) else None),
     # Compact: 202411
     (r'(\d{4})(\d{2})(?!\d)', lambda m: f"{m.group(1)}-{m.group(2)}" if 1 <= int(m.group(2)) <= 12 else None),
+    # Abbreviated: nov25, aug25, may25 (month + 2-digit year)
+    (r'([a-z]{3,9})(\d{2})(?!\d)', lambda m: f"20{m.group(2)}-{MONTHS.get(m.group(1).lower(), '00')}" if MONTHS.get(m.group(1).lower()) else None),
 ]
 
 
