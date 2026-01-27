@@ -75,8 +75,15 @@ def load_sheet(
 
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
+        Returns (0, {}, {}) if sheet doesn't exist
     """
-    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+    except ValueError as e:
+        if "not found" in str(e):
+            # Sheet doesn't exist in this file - skip it
+            return 0, {}, {}
+        raise
     return load_dataframe(df, table_name, schema, period, column_mappings)
 
 
@@ -110,6 +117,11 @@ def load_dataframe(
 
     if df.empty:
         return 0, {}, {}
+
+    # Drop unnamed columns (often navigation links or empty headers)
+    unnamed_cols = [c for c in df.columns if str(c).lower().startswith('unnamed')]
+    if unnamed_cols:
+        df = df.drop(columns=unnamed_cols)
 
     # =========================================================
     # STEP 1: Sanitize and map columns ONCE
@@ -171,8 +183,20 @@ def load_dataframe(
     # =========================================================
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # Create table
+            # Create table (if new)
             cur.execute(ddl)
+
+            # Handle schema evolution: add missing columns
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+            """, (schema, table_name))
+            existing_cols = {row[0] for row in cur.fetchall()}
+
+            for col in df.columns:
+                if col not in existing_cols:
+                    pg_type = column_types.get(col, 'TEXT')
+                    cur.execute(f'ALTER TABLE {full_table} ADD COLUMN "{col}" {pg_type}')
 
             # Prepare data for COPY
             buffer = StringIO()

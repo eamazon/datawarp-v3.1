@@ -305,16 +305,28 @@ def scan(pipeline: str, dry_run: bool):
 
                 for sm in fp.sheet_mappings:
                     with console.status(f"Loading {sm.sheet_pattern or 'data'}..."):
-                        rows, _, _ = load_sheet(
-                            local_path,
-                            sm.sheet_pattern if sm.sheet_pattern else None,
-                            sm.table_name,
-                            period=period,
-                            column_mappings=sm.column_mappings,
-                        )
+                        # Use load_file for CSV, load_sheet for Excel
+                        if f.file_type == 'csv' or not sm.sheet_pattern:
+                            rows, _, _ = load_file(
+                                local_path,
+                                sm.table_name,
+                                period=period,
+                                column_mappings=sm.column_mappings,
+                            )
+                        else:
+                            rows, _, _ = load_sheet(
+                                local_path,
+                                sm.sheet_pattern,
+                                sm.table_name,
+                                period=period,
+                                column_mappings=sm.column_mappings,
+                            )
 
-                    console.print(f"    [green]{sm.table_name}: {rows} rows[/]")
-                    record_load(config.pipeline_id, period, sm.table_name, f.filename, sm.sheet_pattern, rows)
+                    if rows > 0:
+                        console.print(f"    [green]{sm.table_name}: {rows} rows[/]")
+                        record_load(config.pipeline_id, period, sm.table_name, f.filename, sm.sheet_pattern, rows)
+                    else:
+                        console.print(f"    [dim]{sm.table_name}: skipped (sheet not found)[/]")
 
         # Update config with loaded period
         config.add_period(period)
@@ -381,13 +393,22 @@ def backfill(pipeline: str, from_period: Optional[str], to_period: Optional[str]
                     local_path = download_file(f.url, temp_dir)
 
                 for sm in fp.sheet_mappings:
-                    rows, _, _ = load_sheet(
-                        local_path,
-                        sm.sheet_pattern if sm.sheet_pattern else None,
-                        sm.table_name,
-                        period=period,
-                        column_mappings=sm.column_mappings,
-                    )
+                    # Use load_file for CSV, load_sheet for Excel
+                    if f.file_type == 'csv' or not sm.sheet_pattern:
+                        rows, _, _ = load_file(
+                            local_path,
+                            sm.table_name,
+                            period=period,
+                            column_mappings=sm.column_mappings,
+                        )
+                    else:
+                        rows, _, _ = load_sheet(
+                            local_path,
+                            sm.sheet_pattern,
+                            sm.table_name,
+                            period=period,
+                            column_mappings=sm.column_mappings,
+                        )
                     console.print(f"  {sm.table_name}: {rows} rows")
                     record_load(config.pipeline_id, period, sm.table_name, f.filename, sm.sheet_pattern, rows)
 
@@ -471,16 +492,23 @@ def _make_filename_pattern(filename: str) -> str:
     Create a regex pattern from a filename that will match similar files.
 
     e.g., "ADHD-Data-2024-11.xlsx" -> r"ADHD-Data-\d{4}-\d{2}\.xlsx"
+    e.g., "adhd_summary_nov25.xlsx" -> r"adhd_summary_[a-z]{3}\d{2}\.xlsx"
     """
     # Escape special regex chars
     pattern = re.escape(filename)
 
     # Replace date patterns with regex
     # YYYY-MM, YYYY_MM
-    pattern = re.sub(r'\\d{4}[-_]\\d{2}', r'\\d{4}[-_]\\d{2}', pattern)
     pattern = re.sub(r'2\d{3}[-_]\d{2}', r'\\d{4}[-_]\\d{2}', pattern)
 
-    # Month names
+    # Abbreviated month + 2-digit year: nov25, aug25, may25
+    short_months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                    'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+    for month in short_months:
+        # Match month followed by 2 digits (e.g., nov25)
+        pattern = re.sub(f'{month}\\d{{2}}', r'[a-z]{3}\\d{2}', pattern, flags=re.IGNORECASE)
+
+    # Full month names
     months = ['january', 'february', 'march', 'april', 'may', 'june',
               'july', 'august', 'september', 'october', 'november', 'december']
     for month in months:
