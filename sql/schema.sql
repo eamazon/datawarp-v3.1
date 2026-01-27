@@ -31,3 +31,112 @@ ON datawarp.tbl_load_history(pipeline_id);
 
 CREATE INDEX IF NOT EXISTS idx_load_history_period
 ON datawarp.tbl_load_history(period);
+
+-- Enrichment API call logging for observability
+CREATE TABLE IF NOT EXISTS datawarp.tbl_enrichment_log (
+    id SERIAL PRIMARY KEY,
+    pipeline_id VARCHAR(63),
+    source_file VARCHAR(255),
+    sheet_name VARCHAR(100),
+
+    -- LLM details
+    provider VARCHAR(50),
+    model VARCHAR(100),
+
+    -- Request/Response
+    prompt_text TEXT,
+    response_text TEXT,
+
+    -- Tokens and cost
+    input_tokens INT,
+    output_tokens INT,
+    total_tokens INT,
+    cost_usd NUMERIC(10, 6),
+
+    -- Timing
+    duration_ms INT,
+
+    -- Results
+    suggested_table_name VARCHAR(63),
+    suggested_columns JSONB,
+    success BOOLEAN DEFAULT true,
+    error_message TEXT,
+
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_pipeline
+ON datawarp.tbl_enrichment_log(pipeline_id);
+
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_created
+ON datawarp.tbl_enrichment_log(created_at DESC);
+
+-- ============================================================================
+-- METADATA VIEWS (for easy querying)
+-- ============================================================================
+
+-- View: All tables with their metadata
+DROP VIEW IF EXISTS datawarp.v_table_metadata;
+CREATE VIEW datawarp.v_table_metadata AS
+SELECT
+    pc.pipeline_id,
+    pc.config->>'name' as publication_name,
+    m->>'table_name' as table_name,
+    m->>'table_description' as table_description,
+    m->>'grain' as grain,
+    m->>'grain_column' as grain_column,
+    m->'column_mappings' as column_mappings,
+    m->'column_descriptions' as column_descriptions,
+    pc.created_at as config_created,
+    pc.updated_at as config_updated
+FROM datawarp.tbl_pipeline_configs pc,
+     jsonb_array_elements(pc.config->'file_patterns') as fp,
+     jsonb_array_elements(fp->'sheet_mappings') as m;
+
+-- View: Column-level metadata (one row per column)
+DROP VIEW IF EXISTS datawarp.v_column_metadata;
+CREATE VIEW datawarp.v_column_metadata AS
+SELECT
+    pc.pipeline_id,
+    m->>'table_name' as table_name,
+    m->>'grain' as grain,
+    col.key as column_name,
+    col.value as semantic_name,
+    m->'column_descriptions'->>col.value as column_description
+FROM datawarp.tbl_pipeline_configs pc,
+     jsonb_array_elements(pc.config->'file_patterns') as fp,
+     jsonb_array_elements(fp->'sheet_mappings') as m,
+     jsonb_each_text(m->'column_mappings') as col;
+
+-- View: Load statistics per table
+DROP VIEW IF EXISTS datawarp.v_table_stats;
+CREATE VIEW datawarp.v_table_stats AS
+SELECT
+    lh.pipeline_id,
+    lh.table_name,
+    COUNT(DISTINCT lh.period) as periods_loaded,
+    SUM(lh.rows_loaded) as total_rows,
+    MIN(lh.period) as earliest_period,
+    MAX(lh.period) as latest_period,
+    MAX(lh.loaded_at) as last_loaded
+FROM datawarp.tbl_load_history lh
+GROUP BY lh.pipeline_id, lh.table_name;
+
+-- View: Combined table info (metadata + stats)
+DROP VIEW IF EXISTS datawarp.v_tables;
+CREATE VIEW datawarp.v_tables AS
+SELECT
+    COALESCE(tm.pipeline_id, ts.pipeline_id) as pipeline_id,
+    COALESCE(tm.table_name, ts.table_name) as table_name,
+    tm.publication_name,
+    tm.table_description,
+    tm.grain,
+    tm.grain_column,
+    ts.periods_loaded,
+    ts.total_rows,
+    ts.earliest_period,
+    ts.latest_period,
+    ts.last_loaded
+FROM datawarp.v_table_metadata tm
+FULL OUTER JOIN datawarp.v_table_stats ts
+    ON tm.table_name = ts.table_name;

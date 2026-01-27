@@ -1,194 +1,190 @@
-# CLAUDE.md - DataWarp v3.1 Project Rules
+# CLAUDE.md - DataWarp v3.1
 
-## Prime Directive
+**Read this file at the start of every session.**
 
-**Get data into PostgreSQL tables that users can query via MCP.** Everything else is secondary.
+---
 
-## The Mistake We Are Not Repeating
+## What This Project Is
 
-The v3 codebase has 27,000 lines across 39 database tables and zero rows loaded. The DDL bug: column names generated separately for DDL and INSERT, causing mismatches. 
+**DataWarp v3.1** is an NHS data pipeline that:
+1. Discovers Excel/CSV files from NHS landing pages
+2. Detects entity grain (ICB, Trust, GP, Region, National)
+3. Enriches with LLM for semantic table/column names
+4. Loads to PostgreSQL with period tracking
+5. Exposes via MCP for natural language queries
 
-**The fix**: pandas DataFrame.columns is the single source of truth. DDL and INSERT both reference the same list.
+**Ultimate objective:** Enable a chatbot to query NHS data with full context via MCP.
+
+---
+
+## What's Built (Current State)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| URL Discovery | ✅ Working | `src/datawarp/discovery/` |
+| Period Detection | ✅ Working | `src/datawarp/utils/period.py` |
+| Grain Detection | ✅ Working | `src/datawarp/metadata/grain.py` |
+| LLM Enrichment | ✅ Working | `src/datawarp/metadata/enrich.py` |
+| Data Loading | ✅ Working | `src/datawarp/loader/` |
+| Pipeline Config | ✅ Working | `src/datawarp/pipeline/` |
+| MCP Server | ✅ Working | `scripts/mcp_server.py` |
+| Enrichment Logging | ✅ Working | `datawarp.tbl_enrichment_log` |
+
+**CLI Commands:**
+- `bootstrap --url <URL>` - Discover, enrich, load, save pattern
+- `scan --pipeline <ID>` - Load new periods automatically
+- `backfill --pipeline <ID>` - Load historical periods
+- `list` - Show pipelines
+- `history --pipeline <ID>` - Show load history
+
+---
+
+## The V3 Bug We Fixed
+
+V3 had 27,000 lines, 39 tables, and **zero rows loaded**. Column names were generated separately for DDL and INSERT, causing mismatches.
+
+**The fix:** `DataFrame.columns` is the single source of truth.
 
 ```python
 # CORRECT - cannot drift
 df.columns = [sanitized_names]
-ddl = f'CREATE TABLE t ({", ".join(df.columns)})'
-copy = f'COPY t ({", ".join(df.columns)}) FROM STDIN'
-
-# WRONG - the old way, names generated separately
-ddl_cols = generate_ddl_columns(extractor)
-insert_cols = generate_insert_columns(mappings)  # different code path = drift
+ddl = f'CREATE TABLE ({", ".join(df.columns)})'
+copy = f'COPY ({", ".join(df.columns)}) FROM STDIN'
 ```
 
-## MVP Scope - Nothing More
+---
 
-| In Scope | Out of Scope |
-|----------|--------------|
-| Bootstrap: URL → select files/sheets → load → save pattern | LLM enrichment |
-| Scan: detect new periods → load using pattern | Queue system |
-| MCP: list_datasets, get_schema, query | Agent state machine |
-| Heuristic metadata from column names | Multi-user support |
-| 2 config tables + staging tables | 39-table normalised schema |
+## Database Schema (3 Tables)
+
+```sql
+-- datawarp schema (config)
+tbl_pipeline_configs    -- pipeline_id, config (JSONB), timestamps
+tbl_load_history        -- pipeline_id, period, table_name, rows_loaded
+tbl_enrichment_log      -- LLM call logging (tokens, cost, timing)
+
+-- staging schema (data)
+staging.<table_name>    -- Dynamic tables with _period, _loaded_at columns
+```
+
+**Full spec:** `docs/DATABASE_SPEC.md`
+
+---
+
+## Key Architecture Decisions
+
+| Decision | Why |
+|----------|-----|
+| JSONB config storage | Entire PipelineConfig in one column, no 39-table schema |
+| DataFrame is truth | DDL and COPY both use df.columns - prevents drift |
+| Grain detection before enrichment | Skip useless sheets (notes, methodology) |
+| Append-only loading | `_period` column tracks data across periods |
+| Enrichment returns dict | Single application point, no scattered logic |
+
+**Full spec:** `docs/ARCHITECTURE.md`
+
+---
+
+## Quick Reference
+
+### Run Bootstrap
+```bash
+PYTHONPATH=src python scripts/pipeline.py bootstrap \
+  --url "https://digital.nhs.uk/.../mi-adhd" \
+  --id adhd \
+  --enrich
+```
+
+### Check Data Loaded
+```bash
+psql -d datawalker -c "SELECT table_name FROM information_schema.tables WHERE table_schema='staging'"
+psql -d datawalker -c "SELECT * FROM datawarp.tbl_load_history ORDER BY loaded_at DESC LIMIT 10"
+```
+
+### Test MCP
+```bash
+PYTHONPATH=src python scripts/mcp_server.py --test
+```
+
+### Reset Database
+```bash
+./scripts/reset_db.sh
+```
+
+---
 
 ## Coding Rules
 
-### 1. One File Per Concern, Under 300 Lines
-If a file exceeds 300 lines, split it. No exceptions.
+1. **Under 300 lines per file** - Split if larger
+2. **No premature abstraction** - Direct functions over factories
+3. **Fail fast and loud** - Log errors, re-raise exceptions
+4. **Discovery returns data, loading writes to DB** - Never mix
+5. **Test with real NHS URLs** - Assert row counts, not just "no errors"
 
-### 2. No Premature Abstraction
-```python
-# BAD - abstracting before needed
-class DataLoaderFactory:
-    def create_loader(self, file_type): ...
+---
 
-# GOOD - direct and simple
-def load_excel(path, sheet, table, conn): ...
-def load_csv(path, table, conn): ...
+## Session Workflow
+
+### At Session Start
+1. Read this file
+2. Check `docs/tasks/CURRENT.md` for pending work
+3. Run `git status` to see uncommitted changes
+
+### During Work
+- Keep changes focused on one task
+- Test with real NHS URLs
+- Log enrichment calls for observability
+
+### At Session End
+1. Update `docs/tasks/CURRENT.md`
+2. Commit changes with clear message
+3. Note any blockers or next steps
+
+---
+
+## Documentation Structure
+
+```
+docs/
+├── ARCHITECTURE.md      # System design, data flow, components
+├── DATABASE_SPEC.md     # Schema, tables, columns, indexes
+├── USER_GUIDE.md        # CLI usage, examples, troubleshooting
+└── tasks/
+    └── CURRENT.md       # Active work tracking
 ```
 
-### 3. Fail Fast and Loud
-```python
-# BAD - swallowing errors
-try:
-    load_data()
-except Exception:
-    pass  # silent failure
+---
 
-# GOOD - explicit failure
-try:
-    load_data()
-except Exception as e:
-    console.print(f"[red]Load failed: {e}[/red]")
-    raise
+## Environment Setup
+
+```bash
+# Required
+export POSTGRES_HOST=localhost
+export POSTGRES_DB=datawalker
+export POSTGRES_USER=databot
+export POSTGRES_PASSWORD=databot
+
+# For LLM enrichment
+export LLM_PROVIDER=gemini
+export GEMINI_API_KEY=your_key
+export LLM_MODEL=gemini-2.0-flash-exp
 ```
 
-### 4. No Database Writes in Discovery
-Discovery (scraping) returns data structures. Loading writes to database. Never mix.
-
-### 5. JSONB Over Normalisation
-Pipeline config goes in one JSONB column, not spread across 10 tables.
-
-## Testing Rules
-
-### 1. Test With Real NHS URLs
-```python
-# REQUIRED - actual integration test
-def test_bootstrap_adhd():
-    url = "https://digital.nhs.uk/data-and-information/publications/statistical/mi-adhd"
-    files = scrape_landing_page(url)
-    assert len(files) > 0
-    assert any(f.period for f in files)  # periods detected
-```
-
-### 2. Verify Rows Loaded, Not Just "No Errors"
-```python
-# BAD - superficial
-def test_load():
-    load_sheet(path, sheet, table, conn)
-    # no assertion!
-
-# GOOD - verify outcome
-def test_load():
-    success, rows, _ = load_sheet(path, sheet, table, conn)
-    assert success
-    assert rows > 0
-    
-    cur.execute(f"SELECT COUNT(*) FROM staging.{table}")
-    assert cur.fetchone()[0] == rows
-```
-
-### 3. Test the Column Fix Explicitly
-```python
-def test_columns_match_between_ddl_and_data():
-    """The bug that killed v3 - columns must match."""
-    success, rows, learned = load_sheet(path, sheet, table, conn)
-    
-    # Get DDL columns
-    cur.execute("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_name = %s AND table_schema = 'staging'
-    """, (table,))
-    ddl_cols = {r[0] for r in cur.fetchall()}
-    
-    # Get actual data columns
-    df = pd.read_sql(f"SELECT * FROM staging.{table} LIMIT 1", conn)
-    data_cols = set(df.columns)
-    
-    # They must match (minus _row_id)
-    assert data_cols - {'_row_id'} == ddl_cols - {'_row_id'}
-```
-
-### 4. Test Scan Loads to Same Table
-```python
-def test_scan_appends_not_replaces():
-    """New periods append to existing table, not recreate."""
-    # Load period 1
-    load_sheet(file1, sheet, table, "2024-11", {}, conn)
-    cur.execute(f"SELECT COUNT(*) FROM staging.{table}")
-    count1 = cur.fetchone()[0]
-    
-    # Load period 2
-    load_sheet(file2, sheet, table, "2024-12", {}, conn)
-    cur.execute(f"SELECT COUNT(*) FROM staging.{table}")
-    count2 = cur.fetchone()[0]
-    
-    assert count2 > count1  # appended, not replaced
-```
-
-## Definition of Done
-
-### Bootstrap Command
-- [ ] Scrapes URL successfully
-- [ ] Groups files by period
-- [ ] Shows latest period by default
-- [ ] Loads selected sheets to staging schema
-- [ ] Rows > 0 in created tables
-- [ ] Saves PipelineConfig to datawarp.tbl_pipeline_configs
-- [ ] Column mappings saved correctly
-
-### Scan Command
-- [ ] Loads saved PipelineConfig
-- [ ] Detects new periods not in load_history
-- [ ] Loads new periods using saved patterns
-- [ ] Appends to existing tables (not recreate)
-- [ ] Records loads in tbl_load_history
-
-### MCP Server
-- [ ] list_datasets returns tables with row counts
-- [ ] get_schema returns column descriptions
-- [ ] query executes SQL and returns results
-- [ ] Heuristic descriptions are meaningful (not just column names)
+---
 
 ## Red Flags - Stop and Reassess
 
-- Creating a new database table beyond the 2 config tables
+- Creating new database tables beyond the 3 config tables
 - File exceeding 300 lines
-- Adding a "manager", "factory", "orchestrator", or "coordinator" class
-- Writing code that doesn't directly serve bootstrap/scan/mcp
+- Adding "manager", "factory", "orchestrator" classes
 - Tests passing without asserting row counts
-- Catching exceptions without re-raising or logging
+- Swallowing exceptions silently
 
-## Commands to Verify Progress
-
-```bash
-# 1. Does discovery work?
-python -c "from datawarp.discovery import scrape_landing_page; print(len(scrape_landing_page('https://digital.nhs.uk/data-and-information/publications/statistical/mi-adhd')))"
-
-# 2. Does bootstrap create tables with data?
-python scripts/pipeline.py bootstrap --url "https://digital.nhs.uk/data-and-information/publications/statistical/mi-adhd"
-psql -c "SELECT table_name, (SELECT COUNT(*) FROM staging.\"' || table_name || '\") FROM information_schema.tables WHERE table_schema='staging'"
-
-# 3. Does scan detect and load new periods?
-python scripts/pipeline.py scan --pipeline adhd
-
-# 4. Does MCP return useful metadata?
-python scripts/mcp_server.py --test
-```
+---
 
 ## When Stuck
 
-1. Check if data actually loaded: `SELECT COUNT(*) FROM staging.{table}`
-2. Check column names match: compare information_schema.columns to DataFrame.columns
+1. Check data loaded: `SELECT COUNT(*) FROM staging.<table>`
+2. Check columns match: compare `information_schema.columns` to DataFrame
 3. Check period detection: print `file.period` for discovered files
-4. Simplify: remove abstraction, write direct code, get it working, then refactor
+4. Check enrichment logs: `SELECT * FROM datawarp.tbl_enrichment_log ORDER BY created_at DESC`
+5. Simplify: remove abstraction, get it working, then refactor

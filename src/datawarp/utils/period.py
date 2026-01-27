@@ -64,6 +64,50 @@ def parse_period(text: str) -> Optional[str]:
     return None
 
 
+def extract_period_from_url(url: str) -> Optional[str]:
+    """
+    Extract period from URL path, looking for month-year patterns in path segments.
+
+    NHS URLs typically have periods in paths like:
+    - /january-2025/
+    - /december-2024/
+    - /2024-11/
+
+    We look at path segments only, not query strings or hash codes.
+    """
+    if not url:
+        return None
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    path = parsed.path
+
+    # Split into segments and check each one for period patterns
+    # Only match segments that look like period pages (month-year or year-month)
+    segments = [s for s in path.split('/') if s]
+
+    for segment in segments:
+        segment_lower = segment.lower()
+
+        # Pattern 1: month-year (january-2025, jan-2025)
+        match = re.match(r'^([a-z]+)-(\d{4})$', segment_lower)
+        if match:
+            month_str = match.group(1)
+            year = match.group(2)
+            if month_str in MONTHS and 2010 <= int(year) <= 2030:
+                return f"{year}-{MONTHS[month_str]}"
+
+        # Pattern 2: year-month (2025-01)
+        match = re.match(r'^(\d{4})-(\d{2})$', segment_lower)
+        if match:
+            year = match.group(1)
+            month = match.group(2)
+            if 2010 <= int(year) <= 2030 and 1 <= int(month) <= 12:
+                return f"{year}-{month}"
+
+    return None
+
+
 def extract_periods_from_files(files: List[Dict]) -> Dict[str, List[Dict]]:
     """
     Group files by their detected period.
@@ -77,9 +121,18 @@ def extract_periods_from_files(files: List[Dict]) -> Dict[str, List[Dict]]:
     by_period = defaultdict(list)
 
     for f in files:
-        # Try filename first, then URL
-        text = f.get('filename', '') or f.get('url', '')
-        period = parse_period(text)
+        period = None
+
+        # Try filename first
+        filename = f.get('filename', '')
+        if filename:
+            period = parse_period(filename)
+
+        # If no period in filename, try URL path segments (period in /january-2025/)
+        if not period:
+            url = f.get('url', '')
+            if url:
+                period = extract_period_from_url(url)
 
         if period:
             by_period[period].append(f)

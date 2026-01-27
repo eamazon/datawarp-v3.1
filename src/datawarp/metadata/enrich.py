@@ -1,6 +1,7 @@
 """LLM enrichment for semantic column names and descriptions using LiteLLM/Gemini"""
 import json
 import os
+import time
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -13,7 +14,9 @@ def enrich_sheet(
     columns: List[str],
     sample_rows: List[Dict],
     publication_hint: str = "",
-    grain_hint: str = ""
+    grain_hint: str = "",
+    pipeline_id: str = "",
+    source_file: str = "",
 ) -> Dict:
     """
     Call LLM API to get semantic names and descriptions.
@@ -62,7 +65,7 @@ def enrich_sheet(
 
     grain_context = f"\nData grain: {grain_hint} level data" if grain_hint else ""
 
-    prompt = f"""You are analyzing an NHS dataset. Suggest semantic names for this data.
+    prompt = f"""You are analyzing an NHS dataset. Suggest SHORT semantic names for this data.
 
 Sheet name: {sheet_name}
 Publication context: {publication_hint}{grain_context}
@@ -72,7 +75,7 @@ Sample data (first 3 rows):
 
 Respond with JSON only, no markdown code blocks:
 {{
-    "table_name": "lowercase_snake_case_descriptive_name",
+    "table_name": "short_name",
     "table_description": "One sentence describing what this table contains",
     "columns": {{
         "original_col_name": "semantic_name",
@@ -84,12 +87,27 @@ Respond with JSON only, no markdown code blocks:
     }}
 }}
 
-Rules:
-- table_name: lowercase, snake_case, no prefix like tbl_
+CRITICAL Rules for table_name:
+- MAXIMUM 30 characters (will be prefixed with tbl_)
+- lowercase, snake_case, NO prefix like tbl_
+- Keep it SHORT: icb_referrals NOT icb_adhd_referrals_by_month
+- Format: {{grain}}_{{metric}} e.g., icb_referrals, trust_waiting, gp_patients
+- Examples: icb_referrals (good), integrated_care_board_referral_data (too long)
+
+Column rules:
 - Use NHS terminology: icb_code, trust_code, referrals, waiting_list
-- Column names: lowercase, snake_case
-- Descriptions: concise, mention units if applicable
-- Include grain in table_name if appropriate (e.g., icb_referrals, trust_waiting)"""
+- lowercase, snake_case
+- Descriptions: concise, mention units if applicable"""
+
+    start_time = time.time()
+    log_data = {
+        'pipeline_id': pipeline_id,
+        'source_file': source_file,
+        'sheet_name': sheet_name,
+        'provider': provider,
+        'model': model,
+        'prompt_text': prompt,
+    }
 
     try:
         response = completion(
@@ -100,7 +118,18 @@ Rules:
             timeout=int(os.getenv('LLM_TIMEOUT', '60'))
         )
 
+        duration_ms = int((time.time() - start_time) * 1000)
         text = response.choices[0].message.content
+
+        # Extract token usage
+        usage = getattr(response, 'usage', None)
+        if usage:
+            log_data['input_tokens'] = getattr(usage, 'prompt_tokens', 0)
+            log_data['output_tokens'] = getattr(usage, 'completion_tokens', 0)
+            log_data['total_tokens'] = getattr(usage, 'total_tokens', 0)
+
+        log_data['response_text'] = text
+        log_data['duration_ms'] = duration_ms
 
         # Handle potential markdown code blocks
         if "```" in text:
@@ -112,6 +141,9 @@ Rules:
 
         # Validate structure
         if not all(k in result for k in ['table_name', 'columns', 'descriptions']):
+            log_data['success'] = False
+            log_data['error_message'] = "Missing required fields in response"
+            _log_enrichment_call(log_data)
             print("LLM response missing required fields, using fallback")
             return _fallback_enrichment(sheet_name, columns)
 
@@ -119,9 +151,20 @@ Rules:
         if 'table_description' not in result:
             result['table_description'] = f"Data from {sheet_name}"
 
+        # Log successful call
+        log_data['success'] = True
+        log_data['suggested_table_name'] = result['table_name']
+        log_data['suggested_columns'] = result['columns']
+        _log_enrichment_call(log_data)
+
         return result
 
     except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        log_data['duration_ms'] = duration_ms
+        log_data['success'] = False
+        log_data['error_message'] = str(e)
+        _log_enrichment_call(log_data)
         print(f"Enrichment failed: {e}, using fallback")
         return _fallback_enrichment(sheet_name, columns)
 
@@ -137,3 +180,45 @@ def _fallback_enrichment(sheet_name: str, columns: List[str]) -> Dict:
         "columns": {c: c for c in columns},
         "descriptions": {c: "" for c in columns}
     }
+
+
+def _log_enrichment_call(data: Dict) -> None:
+    """Log enrichment API call to database."""
+    try:
+        from ..storage import get_connection
+        import json
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO datawarp.tbl_enrichment_log (
+                        pipeline_id, source_file, sheet_name,
+                        provider, model,
+                        prompt_text, response_text,
+                        input_tokens, output_tokens, total_tokens,
+                        duration_ms,
+                        suggested_table_name, suggested_columns,
+                        success, error_message
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                """, (
+                    data.get('pipeline_id'),
+                    data.get('source_file'),
+                    data.get('sheet_name'),
+                    data.get('provider'),
+                    data.get('model'),
+                    data.get('prompt_text'),
+                    data.get('response_text'),
+                    data.get('input_tokens'),
+                    data.get('output_tokens'),
+                    data.get('total_tokens'),
+                    data.get('duration_ms'),
+                    data.get('suggested_table_name'),
+                    json.dumps(data.get('suggested_columns')) if data.get('suggested_columns') else None,
+                    data.get('success', False),
+                    data.get('error_message'),
+                ))
+    except Exception as e:
+        # Don't fail the enrichment if logging fails
+        print(f"Warning: Failed to log enrichment call: {e}")

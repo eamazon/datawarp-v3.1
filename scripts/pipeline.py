@@ -13,9 +13,10 @@ import os
 import re
 import sys
 import tempfile
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import click
+import requests
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
@@ -24,8 +25,8 @@ from rich.panel import Panel
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from datawarp.discovery import scrape_landing_page, DiscoveredFile
-from datawarp.loader import load_sheet, load_file, download_file, get_sheet_names, preview_sheet
+from datawarp.discovery import scrape_landing_page, DiscoveredFile, classify_url, URLClassification, generate_period_urls
+from datawarp.loader import load_sheet, load_file, download_file, get_sheet_names, preview_sheet, FileExtractor, extract_zip, list_zip_contents
 from datawarp.pipeline import (
     PipelineConfig, FilePattern, SheetMapping,
     save_config, load_config, list_configs, record_load, get_load_history
@@ -35,6 +36,193 @@ from datawarp.storage import get_connection
 from datawarp.metadata import detect_grain, enrich_sheet
 
 console = Console()
+
+
+def _group_files_by_period(files: List) -> dict:
+    """Group DiscoveredFile objects by their period attribute."""
+    by_period = {}
+    for f in files:
+        period = f.period or 'unknown'
+        if period not in by_period:
+            by_period[period] = []
+        by_period[period].append({'filename': f.filename, 'url': f.url, 'file': f})
+    return by_period
+
+
+def _process_data_file(
+    local_path: str,
+    filename: str,
+    file_type: str,
+    period: str,
+    auto_id: str,
+    enrich: bool,
+    console,
+) -> List[Tuple[SheetMapping, int]]:
+    """
+    Process a single data file (CSV, Excel, or ZIP) and return sheet mappings.
+
+    For ZIP files, extracts and recursively processes each data file inside.
+
+    Returns:
+        List of (SheetMapping, rows_loaded) tuples
+    """
+    import pandas as pd
+    from datawarp.metadata import detect_grain, enrich_sheet
+
+    results = []
+
+    if file_type == 'zip':
+        # Extract ZIP and process each file inside
+        console.print(f"  [dim]Extracting ZIP contents...[/]")
+        zip_contents = list_zip_contents(local_path)
+        console.print(f"  Found {len(zip_contents)} data files in ZIP")
+
+        extracted_files = extract_zip(local_path)
+        for extracted_path in extracted_files:
+            ext_filename = os.path.basename(extracted_path)
+            ext_type = os.path.splitext(ext_filename)[1].lower().lstrip('.')
+            console.print(f"\n  [cyan]→ {ext_filename}[/]")
+
+            # Recursively process extracted file
+            sub_results = _process_data_file(
+                extracted_path, ext_filename, ext_type,
+                period, auto_id, enrich, console
+            )
+            results.extend(sub_results)
+
+        return results
+
+    elif file_type in ['xlsx', 'xls']:
+        # Excel file - use FileExtractor for each sheet
+        sheets = get_sheet_names(local_path)
+        console.print(f"  {len(sheets)} sheet(s)")
+
+        for sheet in sheets:
+            try:
+                extractor = FileExtractor(local_path, sheet)
+                df = extractor.to_dataframe()
+
+                if df.empty:
+                    continue
+
+                grain_info = detect_grain(df)
+                grain = grain_info['grain']
+                grain_col = grain_info['grain_column']
+                grain_desc = grain_info['description']
+
+                table_suffix = sanitize_name(sheet)
+                table_name = make_table_name(auto_id, sheet)
+                table_desc = f"Data from {sheet}"
+
+                sanitized_cols = [sanitize_name(str(c)) for c in df.columns]
+                col_mappings = {c: c for c in sanitized_cols}
+                col_descriptions = {}
+
+                # Enrichment (optional)
+                if enrich:
+                    sample_rows = df.head(3).to_dict('records')
+                    enriched = enrich_sheet(
+                        sheet_name=sheet,
+                        columns=sanitized_cols,
+                        sample_rows=sample_rows,
+                        publication_hint=auto_id,
+                        grain_hint=grain,
+                        pipeline_id=auto_id,
+                        source_file=local_path
+                    )
+                    # Use LLM name directly - it should be short and semantic
+                    table_suffix = enriched['table_name']
+                    table_name = f"tbl_{sanitize_name(table_suffix)}"[:63]
+                    table_desc = enriched['table_description']
+                    col_mappings = enriched['columns']
+                    col_descriptions = enriched['descriptions']
+                    console.print(f"    [green]LLM suggested: {table_name}[/]")
+
+                rows, learned_mappings, col_types = load_sheet(
+                    local_path, sheet, table_name,
+                    period=period, column_mappings=col_mappings
+                )
+
+                if rows > 0:
+                    console.print(f"    {sheet}: {rows} rows ({grain})")
+                    results.append((SheetMapping(
+                        sheet_pattern=sheet,
+                        table_name=table_name,
+                        table_description=table_desc,
+                        column_mappings=learned_mappings,
+                        column_descriptions=col_descriptions,
+                        column_types=col_types,
+                        grain=grain,
+                        grain_column=grain_col,
+                        grain_description=grain_desc,
+                    ), rows))
+
+            except Exception as e:
+                console.print(f"    [dim]{sheet}: skipped ({e})[/]")
+
+        return results
+
+    else:
+        # CSV file
+        try:
+            df = pd.read_csv(local_path, low_memory=False)
+        except Exception as e:
+            console.print(f"  [red]Error reading: {e}[/]")
+            return results
+
+        grain_info = detect_grain(df)
+        grain = grain_info['grain']
+        grain_col = grain_info['grain_column']
+        grain_desc = grain_info['description']
+
+        table_suffix = sanitize_name(os.path.splitext(filename)[0])
+        table_name = make_table_name(auto_id, table_suffix)
+        table_desc = f"Data from {filename}"
+
+        sanitized_cols = [sanitize_name(str(c)) for c in df.columns]
+        col_mappings = {c: c for c in sanitized_cols}
+        col_descriptions = {}
+
+        if enrich:
+            console.print(f"  [yellow]Enriching with LLM...[/]")
+            sample_rows = df.head(3).to_dict('records')
+            enriched = enrich_sheet(
+                sheet_name=os.path.splitext(filename)[0],
+                columns=sanitized_cols,
+                sample_rows=sample_rows,
+                publication_hint=auto_id,
+                grain_hint=grain,
+                pipeline_id=auto_id,
+                source_file=local_path
+            )
+            # Use LLM name directly - it should be short and semantic
+            table_suffix = enriched['table_name']
+            table_name = f"tbl_{sanitize_name(table_suffix)}"[:63]
+            table_desc = enriched['table_description']
+            col_mappings = enriched['columns']
+            col_descriptions = enriched['descriptions']
+            console.print(f"  [green]LLM suggested: {table_name}[/]")
+
+        rows, learned_mappings, col_types = load_file(
+            local_path, table_name,
+            period=period, column_mappings=col_mappings
+        )
+
+        if rows > 0:
+            console.print(f"  Loaded {rows} rows ({grain})")
+            results.append((SheetMapping(
+                sheet_pattern='',
+                table_name=table_name,
+                table_description=table_desc,
+                column_mappings=learned_mappings,
+                column_descriptions=col_descriptions,
+                column_types=col_types,
+                grain=grain,
+                grain_column=grain_col,
+                grain_description=grain_desc,
+            ), rows))
+
+        return results
 
 
 @click.group()
@@ -48,7 +236,7 @@ def cli():
 @click.option('--name', help='Pipeline name (auto-generated if not provided)')
 @click.option('--id', 'pipeline_id', help='Pipeline ID (auto-generated if not provided)')
 @click.option('--enrich', is_flag=True, help='Use LLM to generate semantic column names')
-@click.option('--skip-unknown', is_flag=True, default=True, help='Skip sheets with no detected entity')
+@click.option('--skip-unknown/--no-skip-unknown', default=True, help='Skip sheets with no detected entity')
 def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich: bool, skip_unknown: bool):
     """
     Bootstrap a new pipeline from an NHS URL.
@@ -58,11 +246,40 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
 
     Use --enrich to call LLM for semantic column names and descriptions.
     """
-    console.print(f"\n[bold blue]Discovering files from:[/] {url}\n")
+    # Step 1: Classify URL to determine discovery strategy
+    console.print(f"\n[bold blue]Classifying URL...[/]")
+    with console.status("Analyzing URL structure..."):
+        classification = classify_url(url)
 
-    # Step 1: Scrape URL
-    with console.status("Scraping landing page..."):
-        files = scrape_landing_page(url)
+    # Show classification info
+    console.print(Panel(
+        f"[bold]{classification.name}[/]\n"
+        f"ID: {classification.publication_id}\n"
+        f"Source: {classification.source}\n"
+        f"Discovery: [cyan]{classification.discovery_mode}[/]\n"
+        f"Frequency: {classification.frequency}" +
+        (f"\nURL Pattern: {classification.url_pattern}" if classification.url_pattern else "") +
+        (f"\n[yellow]⚠ NHS Digital page with NHS England data[/]" if classification.redirects_to_england else ""),
+        title="URL Classification"
+    ))
+
+    # Handle explicit mode (hash-coded URLs)
+    if classification.discovery_mode == 'explicit':
+        console.print("[yellow]This publication uses hash-coded URLs that cannot be auto-discovered.[/]")
+        console.print("Please provide the exact file URL using --url with a direct file link.")
+        return
+
+    # Step 2: Discover files based on mode
+    # If user gave a period-specific URL (e.g., /january-2026), use that directly
+    if classification.is_period_url:
+        scrape_url = classification.original_url
+        console.print(f"\n[bold blue]Discovering files from period URL:[/] {scrape_url}\n")
+    else:
+        scrape_url = classification.landing_page
+        console.print(f"\n[bold blue]Discovering files from:[/] {scrape_url}\n")
+
+    with console.status("Scraping page..."):
+        files = scrape_landing_page(scrape_url)
 
     if not files:
         console.print("[red]No data files found at this URL[/]")
@@ -70,9 +287,8 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
 
     console.print(f"[green]Found {len(files)} files[/]\n")
 
-    # Step 2: Group by period
-    by_period = extract_periods_from_files([{'filename': f.filename, 'url': f.url, 'file': f} for f in files])
-
+    # Step 2: Group by period (use the period already computed by scraper)
+    by_period = _group_files_by_period(files)
     periods = sorted([p for p in by_period.keys() if p != 'unknown'], reverse=True)
 
     if not periods:
@@ -136,56 +352,180 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
             local_path = download_file(f.url, temp_dir)
 
         if f.file_type in ['xlsx', 'xls']:
-            # Show sheets
+            # Get all sheets and preview each one
             sheets = get_sheet_names(local_path)
-            console.print(f"  Sheets: {', '.join(sheets)}")
+
+            # Build preview table with grain detection
+            console.print(f"\n  [bold]Analyzing {len(sheets)} sheets...[/]")
+            sheet_previews = []
+
+            with console.status("Detecting sheet types..."):
+                for sheet in sheets:
+                    try:
+                        extractor = FileExtractor(local_path, sheet)
+                        structure = extractor.infer_structure()
+
+                        if not structure.is_valid:
+                            sheet_previews.append({
+                                'name': sheet,
+                                'grain': 'invalid',
+                                'rows': 0,
+                                'cols': 0,
+                                'description': 'Could not parse structure',
+                                'extractor': None,
+                                'df': None,
+                            })
+                            continue
+
+                        df = extractor.to_dataframe()
+
+                        if df.empty:
+                            sheet_previews.append({
+                                'name': sheet,
+                                'grain': 'empty',
+                                'rows': 0,
+                                'cols': 0,
+                                'description': 'No data rows',
+                                'extractor': None,
+                                'df': None,
+                            })
+                            continue
+
+                        # Detect grain
+                        grain_info = detect_grain(df)
+
+                        sheet_previews.append({
+                            'name': sheet,
+                            'grain': grain_info['grain'],
+                            'rows': len(df),
+                            'cols': len(df.columns),
+                            'description': grain_info['description'] or _infer_sheet_description(sheet),
+                            'extractor': extractor,
+                            'df': df,
+                            'grain_info': grain_info,
+                        })
+                    except Exception as e:
+                        sheet_previews.append({
+                            'name': sheet,
+                            'grain': 'error',
+                            'rows': 0,
+                            'cols': 0,
+                            'description': str(e)[:50],
+                            'extractor': None,
+                            'df': None,
+                        })
+
+            # Show preview table
+            preview_table = Table(title=f"Sheets in {f.filename}")
+            preview_table.add_column("#", style="dim", width=3)
+            preview_table.add_column("Sheet Name", style="cyan")
+            preview_table.add_column("Grain", style="green")
+            preview_table.add_column("Rows", justify="right")
+            preview_table.add_column("Cols", justify="right")
+            preview_table.add_column("Description")
+
+            data_sheets = []  # Sheets with actual data
+            for i, sp in enumerate(sheet_previews, 1):
+                grain_style = "green" if sp['grain'] not in ('unknown', 'empty', 'invalid', 'error') else "dim"
+                is_data = sp['grain'] not in ('empty', 'invalid', 'error') and sp['rows'] > 0
+
+                if is_data:
+                    data_sheets.append(i)
+
+                preview_table.add_row(
+                    str(i) if is_data else f"[dim]{i}[/]",
+                    sp['name'],
+                    f"[{grain_style}]{sp['grain']}[/]",
+                    str(sp['rows']) if sp['rows'] > 0 else "-",
+                    str(sp['cols']) if sp['cols'] > 0 else "-",
+                    sp['description'][:40] + "..." if len(sp['description']) > 40 else sp['description'],
+                )
+
+            console.print(preview_table)
+
+            # Count sheets by type
+            known_grain = [sp for sp in sheet_previews if sp['grain'] not in ('empty', 'invalid', 'error', 'unknown') and sp['rows'] > 0]
+            unknown_grain = [sp for sp in sheet_previews if sp['grain'] == 'unknown' and sp['rows'] > 0]
+            skip_sheets = [sp for sp in sheet_previews if sp['grain'] in ('empty', 'invalid', 'error')]
+
+            console.print(f"\n  [green]{len(known_grain)} with entity[/], [yellow]{len(unknown_grain)} national/unknown[/], [dim]{len(skip_sheets)} skipped[/]")
 
             # Let user select sheets
             if len(sheets) == 1:
-                selected_sheets = sheets
+                selected_indices = [1]
             else:
-                sheet_selection = Prompt.ask(
-                    "  Select sheets (comma-separated, or 'all')",
-                    default="all"
-                )
-                if sheet_selection.lower() == 'all':
-                    selected_sheets = sheets
+                # Build smart default based on what's available
+                if known_grain:
+                    # Have sheets with detected entities - default to those
+                    default_indices = [i for i, sp in enumerate(sheet_previews, 1)
+                                      if sp['grain'] not in ('empty', 'invalid', 'error', 'unknown') and sp['rows'] > 0]
+                    hint = "Defaulting to sheets with detected entities (ICB/Trust/etc)"
+                elif unknown_grain:
+                    # All data sheets are unknown - probably national aggregates, select all
+                    default_indices = [i for i, sp in enumerate(sheet_previews, 1)
+                                      if sp['grain'] not in ('empty', 'invalid', 'error') and sp['rows'] > 0]
+                    hint = "No entity codes detected - selecting all data sheets (likely national aggregates)"
                 else:
-                    selected_sheets = [s.strip() for s in sheet_selection.split(',')]
-                    selected_sheets = [s for s in selected_sheets if s in sheets]
+                    default_indices = []
+                    hint = "No data sheets found"
+
+                if hint:
+                    console.print(f"  [dim]{hint}[/]")
+
+                default_str = ','.join(map(str, default_indices)) if default_indices else ''
+
+                selection = Prompt.ask(
+                    f"\n  Select sheets (numbers, 'all', or enter for default)",
+                    default=default_str
+                )
+
+                if selection.lower() == 'all':
+                    # All sheets with data (excluding empty/invalid/error)
+                    selected_indices = [i for i, sp in enumerate(sheet_previews, 1)
+                                       if sp['grain'] not in ('empty', 'invalid', 'error') and sp['rows'] > 0]
+                elif selection.lower() == 'data' or selection.lower() == 'known':
+                    # Only sheets with detected entities
+                    selected_indices = [i for i, sp in enumerate(sheet_previews, 1)
+                                       if sp['grain'] not in ('empty', 'invalid', 'error', 'unknown') and sp['rows'] > 0]
+                elif not selection.strip():
+                    # Empty = use defaults
+                    selected_indices = default_indices
+                else:
+                    try:
+                        selected_indices = [int(x.strip()) for x in selection.split(',') if x.strip()]
+                    except ValueError:
+                        # Try matching sheet names
+                        selected_indices = [i for i, sp in enumerate(sheet_previews, 1)
+                                          if sp['name'] in selection]
+
+            # Filter to valid selections with data
+            selected_sheets_data = [
+                sheet_previews[i-1] for i in selected_indices
+                if 1 <= i <= len(sheet_previews) and sheet_previews[i-1]['df'] is not None
+            ]
+
+            if not selected_sheets_data:
+                console.print("  [yellow]No valid sheets selected[/]")
+                continue
 
             # Load each selected sheet
             sheet_mappings = []
-            auto_name = name or _extract_name_from_url(url)
-            auto_id = pipeline_id or sanitize_name(auto_name)
+            auto_name = name or classification.name
+            auto_id = pipeline_id or classification.publication_id
 
-            for sheet in selected_sheets:
-                console.print(f"\n  [bold]Loading sheet: {sheet}[/]")
+            for sp in selected_sheets_data:
+                sheet = sp['name']
+                preview = sp['df']
+                grain_info = sp['grain_info']
 
-                # Preview and detect grain
-                import pandas as pd
-                try:
-                    preview = pd.read_excel(local_path, sheet_name=sheet, nrows=50)
-                except Exception as e:
-                    console.print(f"  [red]Error reading sheet: {e}[/]")
-                    continue
+                console.print(f"\n  [bold]Loading: {sheet}[/] ({sp['rows']} rows, {sp['grain']})")
 
-                if preview.empty:
-                    console.print(f"  [dim]Skipping - empty sheet[/]")
-                    continue
-
-                # Detect grain (entity type)
-                grain_info = detect_grain(preview)
                 grain = grain_info['grain']
                 grain_col = grain_info['grain_column']
                 grain_desc = grain_info['description']
 
-                if skip_unknown and grain == 'unknown':
-                    console.print(f"  [dim]Skipping - no entity detected (probably notes/methodology)[/]")
-                    continue
-
-                console.print(f"  Grain: [cyan]{grain}[/] ({grain_desc})")
-                console.print(f"  Columns: {', '.join(str(c) for c in preview.columns[:5])}{'...' if len(preview.columns) > 5 else ''}")
+                col_names = list(preview.columns[:5])
+                console.print(f"  Columns: {', '.join(col_names)}{'...' if len(preview.columns) > 5 else ''}")
 
                 # Prepare for enrichment
                 sanitized_cols = [sanitize_name(str(c)) for c in preview.columns if not str(c).lower().startswith('unnamed')]
@@ -199,20 +539,24 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
                         columns=sanitized_cols,
                         sample_rows=sample_rows,
                         publication_hint=auto_id,
-                        grain_hint=grain
+                        grain_hint=grain,
+                        pipeline_id=auto_id,
+                        source_file=local_path
                     )
+                    # Use LLM name directly - it should be short and semantic
                     table_suffix = enriched['table_name']
+                    table_name = f"tbl_{sanitize_name(table_suffix)}"[:63]
                     table_desc = enriched['table_description']
                     col_mappings = enriched['columns']
                     col_descriptions = enriched['descriptions']
-                    console.print(f"  [green]LLM suggested: {table_suffix}[/]")
+                    console.print(f"  [green]LLM suggested: {table_name}[/]")
                 else:
                     table_suffix = sanitize_name(sheet)
+                    table_name = make_table_name(auto_id, table_suffix)
                     table_desc = f"Data from {sheet}"
                     col_mappings = {c: c for c in sanitized_cols}
                     col_descriptions = {}
 
-                table_name = f"tbl_{auto_id}_{table_suffix}"
                 console.print(f"  [dim]Table: staging.{table_name}[/]")
 
                 # Load data
@@ -252,11 +596,49 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
                 sheet_mappings=sheet_mappings,
             ))
 
+        elif f.file_type == 'zip':
+            # ZIP file - extract and process each data file inside
+            auto_name = name or classification.name
+            auto_id = pipeline_id or classification.publication_id
+
+            console.print(f"  [dim]Extracting ZIP...[/]")
+            zip_contents = list_zip_contents(local_path)
+            console.print(f"  Found {len(zip_contents)} data file(s) inside")
+
+            for item in zip_contents:
+                console.print(f"    - {item['filename']} ({item['file_type']})")
+
+            # Extract all files
+            extracted_files = extract_zip(local_path)
+            sheet_mappings = []
+
+            for extracted_path in extracted_files:
+                ext_filename = os.path.basename(extracted_path)
+                ext_type = os.path.splitext(ext_filename)[1].lower().lstrip('.')
+                console.print(f"\n  [cyan]Processing: {ext_filename}[/]")
+
+                # Use the helper function for each extracted file
+                results = _process_data_file(
+                    extracted_path, ext_filename, ext_type,
+                    latest, auto_id, enrich, console
+                )
+
+                for mapping, rows in results:
+                    record_load(auto_id, latest, mapping.table_name, f.filename, mapping.sheet_pattern or ext_filename, rows)
+                    sheet_mappings.append(mapping)
+
+            if sheet_mappings:
+                file_patterns.append(FilePattern(
+                    filename_pattern=_make_filename_pattern(f.filename),
+                    file_types=[f.file_type],
+                    sheet_mappings=sheet_mappings,
+                ))
+
         else:
             # CSV file
             import pandas as pd
-            auto_name = name or _extract_name_from_url(url)
-            auto_id = pipeline_id or sanitize_name(auto_name)
+            auto_name = name or classification.name
+            auto_id = pipeline_id or classification.publication_id
 
             # Read preview for grain detection
             try:
@@ -285,20 +667,23 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
                     columns=sanitized_cols,
                     sample_rows=sample_rows,
                     publication_hint=auto_id,
-                    grain_hint=grain
+                    grain_hint=grain,
+                    pipeline_id=auto_id,
+                    source_file=local_path
                 )
+                # Use LLM name directly - it should be short and semantic
                 table_suffix = enriched['table_name']
+                table_name = f"tbl_{sanitize_name(table_suffix)}"[:63]
                 table_desc = enriched['table_description']
                 col_mappings = enriched['columns']
                 col_descriptions = enriched['descriptions']
-                console.print(f"  [green]LLM suggested: {table_suffix}[/]")
+                console.print(f"  [green]LLM suggested: {table_name}[/]")
             else:
                 table_suffix = sanitize_name(os.path.splitext(f.filename)[0])
+                table_name = make_table_name(auto_id, table_suffix)
                 table_desc = f"Data from {f.filename}"
                 col_mappings = {c: c for c in sanitized_cols}
                 col_descriptions = {}
-
-            table_name = f"tbl_{auto_id}_{table_suffix}"
 
             with console.status("Loading to database..."):
                 rows, learned_mappings, col_types = load_file(
@@ -327,16 +712,19 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
             ))
 
     # Step 7: Save pipeline config
-    auto_name = name or _extract_name_from_url(url)
-    auto_id = pipeline_id or sanitize_name(auto_name)
+    auto_name = name or classification.name
+    auto_id = pipeline_id or classification.publication_id
 
     config = PipelineConfig(
         pipeline_id=auto_id,
         name=auto_name,
-        landing_page=url,
+        landing_page=classification.landing_page,
         file_patterns=file_patterns,
         loaded_periods=[latest],
         auto_load=False,
+        discovery_mode=classification.discovery_mode,
+        url_pattern=classification.url_pattern,
+        frequency=classification.frequency,
     )
 
     save_config(config)
@@ -354,11 +742,16 @@ def bootstrap(url: str, name: Optional[str], pipeline_id: Optional[str], enrich:
 @cli.command()
 @click.option('--pipeline', required=True, help='Pipeline ID to scan')
 @click.option('--dry-run', is_flag=True, help='Show what would be loaded without loading')
-def scan(pipeline: str, dry_run: bool):
+@click.option('--force-scrape', is_flag=True, help='Force landing page scrape even in template mode')
+def scan(pipeline: str, dry_run: bool, force_scrape: bool):
     """
     Scan for new periods and load them.
 
     Uses saved patterns from bootstrap to automatically load new data.
+    Discovery mode is determined by the saved pipeline configuration:
+    - template: Generate expected period URLs and check which exist
+    - discover: Scrape landing page for file links
+    - explicit: URLs must be added manually
     """
     config = load_config(pipeline)
     if not config:
@@ -366,13 +759,32 @@ def scan(pipeline: str, dry_run: bool):
         return
 
     console.print(f"\n[bold blue]Scanning:[/] {config.name}")
-    console.print(f"[dim]URL: {config.landing_page}[/]\n")
+    console.print(f"[dim]URL: {config.landing_page}[/]")
+    console.print(f"[dim]Discovery mode: {config.discovery_mode}[/]\n")
 
-    # Discover current files
-    with console.status("Scraping landing page..."):
-        files = scrape_landing_page(config.landing_page)
+    # Handle explicit mode
+    if config.discovery_mode == 'explicit':
+        console.print("[yellow]This pipeline uses explicit mode - URLs must be added manually.[/]")
+        return
 
-    by_period = extract_periods_from_files([{'filename': f.filename, 'url': f.url, 'file': f} for f in files])
+    # Discover current files based on mode
+    files = []
+    if config.discovery_mode == 'template' and config.url_pattern and not force_scrape:
+        # Template mode: generate period URLs and probe for files
+        console.print(f"[dim]Template: {config.url_pattern}[/]")
+        files = _discover_via_template(config, console)
+
+        if not files:
+            # Fallback to scraping if template discovery fails
+            console.print("[dim]Template discovery found no files, falling back to scrape...[/]")
+            with console.status("Scraping landing page..."):
+                files = scrape_landing_page(config.landing_page)
+    else:
+        # Discover mode: scrape landing page
+        with console.status("Scraping landing page..."):
+            files = scrape_landing_page(config.landing_page)
+
+    by_period = _group_files_by_period(files)
     available = sorted([p for p in by_period.keys() if p != 'unknown'], reverse=True)
 
     # Find new periods
@@ -463,7 +875,7 @@ def backfill(pipeline: str, from_period: Optional[str], to_period: Optional[str]
     with console.status("Scraping landing page..."):
         files = scrape_landing_page(config.landing_page)
 
-    by_period = extract_periods_from_files([{'filename': f.filename, 'url': f.url, 'file': f} for f in files])
+    by_period = _group_files_by_period(files)
     available = sorted([p for p in by_period.keys() if p != 'unknown'])
 
     # Filter by range
@@ -586,6 +998,24 @@ def history(pipeline: str):
     console.print(table)
 
 
+def _infer_sheet_description(sheet_name: str) -> str:
+    """Infer a description from sheet name."""
+    name_lower = sheet_name.lower()
+
+    if 'title' in name_lower or 'cover' in name_lower:
+        return 'Title/cover page'
+    if 'content' in name_lower:
+        return 'Table of contents'
+    if 'note' in name_lower or 'quality' in name_lower:
+        return 'Notes/methodology'
+    if 'definition' in name_lower:
+        return 'Definitions'
+
+    # Clean up table names
+    clean = sheet_name.replace('_', ' ').replace('-', ' ')
+    return f"Data: {clean}"
+
+
 def _extract_name_from_url(url: str) -> str:
     """Extract a reasonable name from URL path."""
     # e.g., /statistical/mi-adhd -> MI ADHD
@@ -622,6 +1052,61 @@ def _make_filename_pattern(filename: str) -> str:
         pattern = re.sub(month, r'[a-z]+', pattern, flags=re.IGNORECASE)
 
     return pattern
+
+
+def _discover_via_template(config, console) -> List:
+    """
+    Discover files by generating period URLs from template.
+
+    For NHS Digital publications with predictable URLs, this is faster than
+    scraping because we can generate URLs directly and check if they exist.
+
+    Returns list of DiscoveredFile objects for periods that exist.
+    """
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+
+    # Determine the period range to probe
+    # Start from month after last loaded period, or 12 months back if none loaded
+    if config.loaded_periods:
+        last_loaded = max(config.loaded_periods)
+        start = datetime.strptime(last_loaded, '%Y-%m') + relativedelta(months=1)
+    else:
+        start = datetime.now() - relativedelta(months=12)
+
+    end = datetime.now()
+
+    # Generate period URLs
+    period_urls = generate_period_urls(
+        config.url_pattern,
+        config.landing_page,
+        start.strftime('%Y-%m'),
+        end.strftime('%Y-%m')
+    )
+
+    discovered = []
+    with console.status(f"Probing {len(period_urls)} period URLs..."):
+        for url in period_urls:
+            try:
+                # HEAD request to check if period page exists
+                resp = requests.head(url, timeout=5, allow_redirects=True)
+                if resp.status_code == 200:
+                    # Period page exists - scrape it for files
+                    files = scrape_landing_page(url)
+                    if files:
+                        discovered.extend(files)
+                        console.print(f"  [green]✓[/] {url.split('/')[-1]}: {len(files)} files")
+                    else:
+                        console.print(f"  [yellow]○[/] {url.split('/')[-1]}: page exists but no files")
+                elif resp.status_code == 404:
+                    # Period doesn't exist yet - expected for future months
+                    console.print(f"  [dim]✗ {url.split('/')[-1]}: not found[/]")
+                else:
+                    console.print(f"  [dim]? {url.split('/')[-1]}: HTTP {resp.status_code}[/]")
+            except requests.RequestException as e:
+                console.print(f"  [red]! {url.split('/')[-1]}: {e}[/]")
+
+    return discovered
 
 
 if __name__ == '__main__':

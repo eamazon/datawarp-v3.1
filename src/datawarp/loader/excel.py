@@ -1,7 +1,7 @@
-"""Load Excel/CSV files to PostgreSQL with the critical column fix"""
+"""Load Excel/CSV/ZIP files to PostgreSQL with the critical column fix"""
 import os
-import re
 import tempfile
+import zipfile
 from io import StringIO
 from typing import Dict, List, Optional, Tuple
 
@@ -10,6 +10,7 @@ import requests
 
 from ..storage import get_connection
 from ..utils.sanitize import sanitize_name
+from .extractor import FileExtractor, get_sheet_names, clear_workbook_cache
 
 
 def download_file(url: str, target_dir: Optional[str] = None) -> str:
@@ -33,6 +34,64 @@ def download_file(url: str, target_dir: Optional[str] = None) -> str:
     return local_path
 
 
+def extract_zip(zip_path: str, target_dir: Optional[str] = None) -> List[str]:
+    """
+    Extract a zip file and return paths to data files inside.
+
+    Returns list of paths to CSV/Excel files found in the zip.
+    """
+    if target_dir is None:
+        target_dir = tempfile.mkdtemp()
+
+    data_files = []
+    data_extensions = {'.csv', '.xlsx', '.xls'}
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for name in zf.namelist():
+            # Skip directories and hidden files
+            if name.endswith('/') or name.startswith('__') or name.startswith('.'):
+                continue
+
+            ext = os.path.splitext(name)[1].lower()
+            if ext in data_extensions:
+                # Extract file
+                zf.extract(name, target_dir)
+                data_files.append(os.path.join(target_dir, name))
+
+    return data_files
+
+
+def list_zip_contents(zip_path: str) -> List[dict]:
+    """
+    List data files inside a zip without extracting.
+
+    Returns list of dicts with 'filename', 'size', 'file_type'.
+    """
+    contents = []
+    data_extensions = {'.csv', '.xlsx', '.xls'}
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+
+            name = info.filename
+            # Skip hidden/system files
+            if name.startswith('__') or name.startswith('.'):
+                continue
+
+            ext = os.path.splitext(name)[1].lower()
+            if ext in data_extensions:
+                contents.append({
+                    'filename': os.path.basename(name),
+                    'path': name,
+                    'size': info.file_size,
+                    'file_type': ext.lstrip('.'),
+                })
+
+    return contents
+
+
 def load_file(
     file_path: str,
     table_name: str,
@@ -42,7 +101,10 @@ def load_file(
     column_mappings: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Dict[str, str], Dict[str, str]]:
     """
-    Load a file (Excel or CSV) to PostgreSQL.
+    Load a file (Excel, CSV, or ZIP) to PostgreSQL.
+
+    For ZIP files, extracts and loads the first data file found.
+    Use extract_zip() for more control over which files to load.
 
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
@@ -50,97 +112,20 @@ def load_file(
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext == '.csv':
-        df = pd.read_csv(file_path)
+        df = pd.read_csv(file_path, low_memory=False)
+        return load_dataframe(df, table_name, schema, period, column_mappings)
     elif ext in ['.xlsx', '.xls']:
-        df = pd.read_excel(file_path, sheet_name=sheet_name or 0)
+        # Use FileExtractor for Excel files
+        return load_sheet(file_path, sheet_name or 0, table_name, schema, period, column_mappings)
+    elif ext == '.zip':
+        # Extract and load first data file
+        extracted = extract_zip(file_path)
+        if not extracted:
+            raise ValueError(f"No data files (CSV/Excel) found in zip: {file_path}")
+        # Load the first file found
+        return load_file(extracted[0], table_name, schema, period, sheet_name, column_mappings)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
-
-    return load_dataframe(df, table_name, schema, period, column_mappings)
-
-
-def _detect_header_row(file_path: str, sheet_name: str, max_rows: int = 25) -> int:
-    """
-    Detect the actual header row in an Excel sheet with multi-row headers.
-
-    NHS Excel files often have:
-    - Empty rows
-    - "Return to contents" link
-    - Table title
-    - Header row(s)
-    - Data rows
-
-    Strategy: Find the last row before numeric data starts.
-
-    Returns the 0-indexed row number to use as header.
-    """
-    try:
-        # Read without header to inspect raw data
-        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=max_rows)
-    except Exception:
-        return 0  # Default to first row
-
-    # Skip patterns - rows that are navigation/title/metadata
-    skip_patterns = [
-        'return to contents', 'table of contents', 'contents',
-        'notes:', 'source:', 'methodology', '©', 'copyright',
-        'table 1', 'table 2', 'table 3', 'table 4', 'table 5',
-        'table 6', 'table 7', 'figure', 'chart',
-    ]
-
-    # Find the first row with numeric data (this is actual data, not headers)
-    first_data_row = None
-    for idx, row in df_raw.iterrows():
-        non_empty = row.dropna()
-        if len(non_empty) < 2:
-            continue
-
-        # Count numeric values in this row
-        numeric_count = sum(1 for v in non_empty if _is_numeric(v))
-
-        # If >50% of non-empty cells are numeric, this is likely data
-        if numeric_count >= len(non_empty) * 0.5 and numeric_count >= 2:
-            first_data_row = idx
-            break
-
-    if first_data_row is None:
-        return 0
-
-    # The header is the row just before the first data row
-    # But we need to find the best header row (not empty, not title)
-    best_header = first_data_row - 1
-
-    # Walk backwards to find a good header row
-    for idx in range(first_data_row - 1, -1, -1):
-        row = df_raw.iloc[idx]
-        non_empty = row.dropna()
-
-        if len(non_empty) < 2:
-            continue  # Skip mostly empty rows
-
-        # Check if this looks like navigation/title
-        row_text = ' '.join(str(v).lower() for v in non_empty)
-        if any(pattern in row_text for pattern in skip_patterns):
-            continue
-
-        # This is a candidate header row
-        best_header = idx
-        break
-
-    return max(0, best_header)
-
-
-def _is_numeric(value) -> bool:
-    """Check if a value is numeric (int, float, or numeric string)."""
-    if isinstance(value, (int, float)) and not pd.isna(value):
-        return True
-    if isinstance(value, str):
-        try:
-            float(value.replace(',', ''))
-            return True
-        except ValueError:
-            pass
-    return False
 
 
 def load_sheet(
@@ -152,25 +137,47 @@ def load_sheet(
     column_mappings: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Dict[str, str], Dict[str, str]]:
     """
-    Load a specific Excel sheet to PostgreSQL.
+    Load a specific Excel sheet to PostgreSQL using FileExtractor.
 
-    This is the CRITICAL function with the column fix.
-    Pandas DataFrame becomes the SINGLE SOURCE OF TRUTH for column names.
+    CRITICAL: Uses FileExtractor for structure detection, then DataFrame as
+    single source of truth for DDL and COPY (prevents column drift).
 
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
         Returns (0, {}, {}) if sheet doesn't exist
     """
+    # Handle sheet_name as int (index) or str (name)
+    if isinstance(sheet_name, int):
+        try:
+            sheets = get_sheet_names(file_path)
+            if sheet_name < len(sheets):
+                sheet_name = sheets[sheet_name]
+            else:
+                return 0, {}, {}
+        except Exception:
+            return 0, {}, {}
+
     try:
-        # Detect the actual header row (handles multi-row headers)
-        header_row = _detect_header_row(file_path, sheet_name)
-        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
+        # Use FileExtractor for sophisticated header detection
+        extractor = FileExtractor(file_path, sheet_name)
+        df = extractor.to_dataframe()
+
+        if df.empty:
+            return 0, {}, {}
+
+        # Get column types from extractor
+        structure = extractor.infer_structure()
+        extractor_types = {}
+        for col_info in structure.columns.values():
+            extractor_types[col_info.pg_name] = col_info.inferred_type
+
+        return load_dataframe(df, table_name, schema, period, column_mappings, extractor_types)
+
     except ValueError as e:
         if "not found" in str(e):
             # Sheet doesn't exist in this file - skip it
             return 0, {}, {}
         raise
-    return load_dataframe(df, table_name, schema, period, column_mappings)
 
 
 def load_dataframe(
@@ -179,6 +186,7 @@ def load_dataframe(
     schema: str = 'staging',
     period: Optional[str] = None,
     column_mappings: Optional[Dict[str, str]] = None,
+    extractor_types: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Dict[str, str], Dict[str, str]]:
     """
     Load a DataFrame to PostgreSQL.
@@ -189,10 +197,19 @@ def load_dataframe(
     3. Use df.columns for DDL AND COPY
     4. CANNOT DRIFT because same source
 
+    Args:
+        df: DataFrame to load
+        table_name: Target table name
+        schema: Database schema
+        period: Period string (e.g., "2024-11")
+        column_mappings: Optional column name mappings
+        extractor_types: Optional type hints from FileExtractor
+
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
     """
     column_mappings = column_mappings or {}
+    extractor_types = extractor_types or {}
 
     # Skip empty DataFrames
     if df.empty:
@@ -242,12 +259,17 @@ def load_dataframe(
 
     # =========================================================
     # STEP 2: Infer PostgreSQL types from DataFrame
+    # Use extractor_types if available (more sophisticated)
     # =========================================================
     column_types = {}
     col_defs = []
 
     for col in df.columns:
-        pg_type = _infer_pg_type(df[col])
+        # Use extractor type if available, otherwise infer from DataFrame
+        if col in extractor_types:
+            pg_type = extractor_types[col]
+        else:
+            pg_type = _infer_pg_type(df[col])
         column_types[col] = pg_type
         col_defs.append(f'"{col}" {pg_type}')
 
@@ -357,12 +379,24 @@ def _infer_pg_type(series: pd.Series) -> str:
     return 'TEXT'
 
 
-def get_sheet_names(file_path: str) -> List[str]:
-    """Get list of sheet names from an Excel file."""
-    xl = pd.ExcelFile(file_path)
-    return xl.sheet_names
-
-
 def preview_sheet(file_path: str, sheet_name: str, nrows: int = 5) -> pd.DataFrame:
-    """Preview first N rows of a sheet."""
-    return pd.read_excel(file_path, sheet_name=sheet_name, nrows=nrows)
+    """Preview first N rows of a sheet using FileExtractor."""
+    try:
+        extractor = FileExtractor(file_path, sheet_name)
+        df = extractor.to_dataframe()
+        return df.head(nrows)
+    except Exception:
+        # Fallback to simple pandas read
+        return pd.read_excel(file_path, sheet_name=sheet_name, nrows=nrows)
+
+
+# Re-export from extractor
+__all__ = [
+    'download_file',
+    'load_file',
+    'load_sheet',
+    'load_dataframe',
+    'preview_sheet',
+    'get_sheet_names',
+    'clear_workbook_cache',
+]

@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from ..utils.period import parse_period
+from ..utils.period import parse_period, extract_period_from_url
 
 
 @dataclass
@@ -42,8 +42,12 @@ def scrape_landing_page(url: str, follow_links: bool = True) -> List[DiscoveredF
     files = []
     visited: Set[str] = set()
 
-    # Scrape main page
-    main_files, sub_links = _scrape_page(url)
+    # Check if URL itself is a period page (e.g., /january-2026)
+    # If so, files on this page should inherit that period
+    page_period = extract_period_from_url(url)
+
+    # Scrape main page (pass period if this IS a period page)
+    main_files, sub_links = _scrape_page(url, inherit_period=page_period)
     files.extend(main_files)
     visited.add(url)
 
@@ -52,7 +56,10 @@ def scrape_landing_page(url: str, follow_links: bool = True) -> List[DiscoveredF
         for link in sub_links:
             if link not in visited:
                 visited.add(link)
-                sub_files, _ = _scrape_page(link)
+                # Extract period from the sub-page URL (e.g., /december-2025/)
+                # Files on this page inherit this period if they don't have their own
+                page_period = extract_period_from_url(link)
+                sub_files, _ = _scrape_page(link, inherit_period=page_period)
                 files.extend(sub_files)
 
     # Dedupe by URL
@@ -66,9 +73,14 @@ def scrape_landing_page(url: str, follow_links: bool = True) -> List[DiscoveredF
     return unique_files
 
 
-def _scrape_page(url: str) -> tuple[List[DiscoveredFile], List[str]]:
+def _scrape_page(url: str, inherit_period: Optional[str] = None) -> tuple[List[DiscoveredFile], List[str]]:
     """
     Scrape a single page for files and sub-links.
+
+    Args:
+        url: Page URL to scrape
+        inherit_period: Period to assign to files that don't have their own
+                       (used when scraping sub-pages like /december-2025/)
 
     Returns:
         Tuple of (discovered files, sub-page links to follow)
@@ -98,7 +110,11 @@ def _scrape_page(url: str) -> tuple[List[DiscoveredFile], List[str]]:
         if ext in DATA_EXTENSIONS:
             filename = path.split('/')[-1]
             title = _get_link_context(link)
-            period = parse_period(filename) or parse_period(full_url) or parse_period(title or '')
+            # Try filename first, then URL path, then link context, then inherit from page
+            period = (parse_period(filename) or
+                     extract_period_from_url(full_url) or
+                     parse_period(title or '') or
+                     inherit_period)
 
             files.append(DiscoveredFile(
                 url=full_url,

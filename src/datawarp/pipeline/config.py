@@ -68,6 +68,10 @@ class PipelineConfig:
     file_patterns: List[FilePattern] = field(default_factory=list)
     loaded_periods: List[str] = field(default_factory=list)  # ["2024-11", "2024-12"]
     auto_load: bool = False
+    # Discovery configuration
+    discovery_mode: str = 'discover'  # template, discover, explicit
+    url_pattern: Optional[str] = None  # For template mode: '{landing_page}/{month_name}-{year}'
+    frequency: str = 'monthly'  # monthly, quarterly, annual
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +81,9 @@ class PipelineConfig:
             'file_patterns': [f.to_dict() for f in self.file_patterns],
             'loaded_periods': self.loaded_periods,
             'auto_load': self.auto_load,
+            'discovery_mode': self.discovery_mode,
+            'url_pattern': self.url_pattern,
+            'frequency': self.frequency,
         }
 
     def to_json(self) -> str:
@@ -91,6 +98,9 @@ class PipelineConfig:
             file_patterns=[FilePattern.from_dict(f) for f in data.get('file_patterns', [])],
             loaded_periods=data.get('loaded_periods', []),
             auto_load=data.get('auto_load', False),
+            discovery_mode=data.get('discovery_mode', 'discover'),
+            url_pattern=data.get('url_pattern'),
+            frequency=data.get('frequency', 'monthly'),
         )
 
     @classmethod
