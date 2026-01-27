@@ -59,6 +59,90 @@ def load_file(
     return load_dataframe(df, table_name, schema, period, column_mappings)
 
 
+def _detect_header_row(file_path: str, sheet_name: str, max_rows: int = 25) -> int:
+    """
+    Detect the actual header row in an Excel sheet with multi-row headers.
+
+    NHS Excel files often have:
+    - Empty rows
+    - "Return to contents" link
+    - Table title
+    - Header row(s)
+    - Data rows
+
+    Strategy: Find the last row before numeric data starts.
+
+    Returns the 0-indexed row number to use as header.
+    """
+    try:
+        # Read without header to inspect raw data
+        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=max_rows)
+    except Exception:
+        return 0  # Default to first row
+
+    # Skip patterns - rows that are navigation/title/metadata
+    skip_patterns = [
+        'return to contents', 'table of contents', 'contents',
+        'notes:', 'source:', 'methodology', '©', 'copyright',
+        'table 1', 'table 2', 'table 3', 'table 4', 'table 5',
+        'table 6', 'table 7', 'figure', 'chart',
+    ]
+
+    # Find the first row with numeric data (this is actual data, not headers)
+    first_data_row = None
+    for idx, row in df_raw.iterrows():
+        non_empty = row.dropna()
+        if len(non_empty) < 2:
+            continue
+
+        # Count numeric values in this row
+        numeric_count = sum(1 for v in non_empty if _is_numeric(v))
+
+        # If >50% of non-empty cells are numeric, this is likely data
+        if numeric_count >= len(non_empty) * 0.5 and numeric_count >= 2:
+            first_data_row = idx
+            break
+
+    if first_data_row is None:
+        return 0
+
+    # The header is the row just before the first data row
+    # But we need to find the best header row (not empty, not title)
+    best_header = first_data_row - 1
+
+    # Walk backwards to find a good header row
+    for idx in range(first_data_row - 1, -1, -1):
+        row = df_raw.iloc[idx]
+        non_empty = row.dropna()
+
+        if len(non_empty) < 2:
+            continue  # Skip mostly empty rows
+
+        # Check if this looks like navigation/title
+        row_text = ' '.join(str(v).lower() for v in non_empty)
+        if any(pattern in row_text for pattern in skip_patterns):
+            continue
+
+        # This is a candidate header row
+        best_header = idx
+        break
+
+    return max(0, best_header)
+
+
+def _is_numeric(value) -> bool:
+    """Check if a value is numeric (int, float, or numeric string)."""
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value.replace(',', ''))
+            return True
+        except ValueError:
+            pass
+    return False
+
+
 def load_sheet(
     file_path: str,
     sheet_name: str,
@@ -78,7 +162,9 @@ def load_sheet(
         Returns (0, {}, {}) if sheet doesn't exist
     """
     try:
-        df = pd.read_excel(file_path, sheet_name=sheet_name)
+        # Detect the actual header row (handles multi-row headers)
+        header_row = _detect_header_row(file_path, sheet_name)
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
     except ValueError as e:
         if "not found" in str(e):
             # Sheet doesn't exist in this file - skip it
