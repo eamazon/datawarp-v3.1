@@ -19,6 +19,7 @@ from datawarp.cli.sheet_selector import (
 )
 from datawarp.cli.bootstrap import bootstrap_command
 from datawarp.cli.scan import scan_command
+from datawarp.cli.enrich import enrich_command
 
 __all__ = [
     'console',
@@ -34,4 +35,5 @@ __all__ = [
     'select_sheets',
     'bootstrap_command',
     'scan_command',
+    'enrich_command',
 ]
