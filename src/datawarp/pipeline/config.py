@@ -16,6 +16,9 @@ class SheetMapping:
     grain: str = "unknown"          # "icb", "trust", "national", "unknown"
     grain_column: Optional[str] = None  # which column has the entity
     grain_description: str = ""     # "ICB level data"
+    # Version tracking for incremental enrichment
+    mappings_version: int = 1       # Bumped when columns added/enriched
+    last_enriched: Optional[str] = None  # ISO timestamp of last enrichment
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -33,6 +36,8 @@ class SheetMapping:
             grain=data.get('grain', 'unknown'),
             grain_column=data.get('grain_column'),
             grain_description=data.get('grain_description', ''),
+            mappings_version=data.get('mappings_version', 1),
+            last_enriched=data.get('last_enriched'),
         )
 
 

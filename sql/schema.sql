@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS datawarp.tbl_enrichment_log (
     success BOOLEAN DEFAULT true,
     error_message TEXT,
 
+    -- Column compression tracking (for timeseries data)
+    original_column_count INT,
+    compressed_column_count INT,
+    pattern_detected VARCHAR(100),
+
     created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -71,22 +76,60 @@ ON datawarp.tbl_enrichment_log(pipeline_id);
 CREATE INDEX IF NOT EXISTS idx_enrichment_log_created
 ON datawarp.tbl_enrichment_log(created_at DESC);
 
+-- CLI run tracker (eventstore pattern for observability)
+CREATE TABLE IF NOT EXISTS datawarp.tbl_cli_runs (
+    id SERIAL PRIMARY KEY,
+    pipeline_id VARCHAR(63),  -- nullable for commands that don't target a pipeline
+
+    -- Command details
+    command VARCHAR(50) NOT NULL,  -- bootstrap, scan, backfill, list, history
+    args JSONB,  -- command arguments as JSON
+
+    -- Timing
+    started_at TIMESTAMP DEFAULT NOW(),
+    ended_at TIMESTAMP,
+    duration_ms INT,
+
+    -- Result
+    status VARCHAR(20) NOT NULL DEFAULT 'running',  -- running, success, failed, cancelled
+    error_message TEXT,
+    result_summary JSONB,  -- flexible summary (rows loaded, files processed, etc.)
+
+    -- Context
+    hostname VARCHAR(255),
+    username VARCHAR(100)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cli_runs_pipeline
+ON datawarp.tbl_cli_runs(pipeline_id);
+
+CREATE INDEX IF NOT EXISTS idx_cli_runs_started
+ON datawarp.tbl_cli_runs(started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_cli_runs_status
+ON datawarp.tbl_cli_runs(status);
+
 -- ============================================================================
 -- METADATA VIEWS (for easy querying)
 -- ============================================================================
 
 -- View: All tables with their metadata
-DROP VIEW IF EXISTS datawarp.v_table_metadata;
+DROP VIEW IF EXISTS datawarp.v_table_metadata CASCADE;
 CREATE VIEW datawarp.v_table_metadata AS
 SELECT
     pc.pipeline_id,
     pc.config->>'name' as publication_name,
+    pc.config->>'landing_page' as landing_page,
     m->>'table_name' as table_name,
     m->>'table_description' as table_description,
     m->>'grain' as grain,
     m->>'grain_column' as grain_column,
+    m->>'grain_description' as grain_description,
     m->'column_mappings' as column_mappings,
     m->'column_descriptions' as column_descriptions,
+    -- Version tracking for incremental enrichment
+    COALESCE((m->>'mappings_version')::int, 1) as mappings_version,
+    m->>'last_enriched' as last_enriched,
     pc.created_at as config_created,
     pc.updated_at as config_updated
 FROM datawarp.tbl_pipeline_configs pc,
@@ -94,22 +137,31 @@ FROM datawarp.tbl_pipeline_configs pc,
      jsonb_array_elements(fp->'sheet_mappings') as m;
 
 -- View: Column-level metadata (one row per column)
-DROP VIEW IF EXISTS datawarp.v_column_metadata;
+DROP VIEW IF EXISTS datawarp.v_column_metadata CASCADE;
 CREATE VIEW datawarp.v_column_metadata AS
 SELECT
     pc.pipeline_id,
     m->>'table_name' as table_name,
     m->>'grain' as grain,
-    col.key as column_name,
+    col.key as original_name,
     col.value as semantic_name,
-    m->'column_descriptions'->>col.value as column_description
+    -- Column is enriched if semantic_name differs from original
+    col.key != col.value as is_enriched,
+    COALESCE(
+        m->'column_descriptions'->>col.value,
+        m->'column_descriptions'->>col.key,
+        ''
+    ) as column_description,
+    -- Version tracking
+    COALESCE((m->>'mappings_version')::int, 1) as mappings_version,
+    m->>'last_enriched' as last_enriched
 FROM datawarp.tbl_pipeline_configs pc,
      jsonb_array_elements(pc.config->'file_patterns') as fp,
      jsonb_array_elements(fp->'sheet_mappings') as m,
      jsonb_each_text(m->'column_mappings') as col;
 
 -- View: Load statistics per table
-DROP VIEW IF EXISTS datawarp.v_table_stats;
+DROP VIEW IF EXISTS datawarp.v_table_stats CASCADE;
 CREATE VIEW datawarp.v_table_stats AS
 SELECT
     lh.pipeline_id,
@@ -123,15 +175,19 @@ FROM datawarp.tbl_load_history lh
 GROUP BY lh.pipeline_id, lh.table_name;
 
 -- View: Combined table info (metadata + stats)
-DROP VIEW IF EXISTS datawarp.v_tables;
+DROP VIEW IF EXISTS datawarp.v_tables CASCADE;
 CREATE VIEW datawarp.v_tables AS
 SELECT
     COALESCE(tm.pipeline_id, ts.pipeline_id) as pipeline_id,
     COALESCE(tm.table_name, ts.table_name) as table_name,
     tm.publication_name,
+    tm.landing_page,
     tm.table_description,
     tm.grain,
     tm.grain_column,
+    tm.grain_description,
+    tm.mappings_version,
+    tm.last_enriched,
     ts.periods_loaded,
     ts.total_rows,
     ts.earliest_period,

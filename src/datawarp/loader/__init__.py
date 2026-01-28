@@ -9,5 +9,6 @@ from .excel import (
     clear_workbook_cache,
     extract_zip,
     list_zip_contents,
+    detect_column_drift,
 )
 from .extractor import FileExtractor, TableStructure, ColumnInfo

@@ -2,15 +2,22 @@
 import os
 import tempfile
 import zipfile
+from datetime import datetime
 from io import StringIO
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import pandas as pd
 import requests
+from rich.console import Console
 
 from ..storage import get_connection
 from ..utils.sanitize import sanitize_name
 from .extractor import FileExtractor, get_sheet_names, clear_workbook_cache
+
+if TYPE_CHECKING:
+    from ..pipeline.config import SheetMapping
+
+console = Console()
 
 
 def download_file(url: str, target_dir: Optional[str] = None) -> str:
@@ -92,6 +99,45 @@ def list_zip_contents(zip_path: str) -> List[dict]:
     return contents
 
 
+def detect_column_drift(
+    df_columns: List[str],
+    sheet_mapping: 'SheetMapping'
+) -> Dict[str, Any]:
+    """
+    Compare DataFrame columns against saved mappings.
+
+    Detects schema drift between what's in the data file vs what's
+    saved in the pipeline config.
+
+    Args:
+        df_columns: Column names from the current DataFrame
+        sheet_mapping: SheetMapping with saved column_mappings
+
+    Returns:
+        {
+            'new_cols': set of columns in df but not in mappings,
+            'missing_cols': set of columns in mappings but not in df,
+            'has_drift': bool indicating if any drift detected
+        }
+    """
+    # Sanitize df column names for comparison
+    current_cols = {sanitize_name(str(c)) for c in df_columns}
+    saved_cols = set(sheet_mapping.column_mappings.keys())
+
+    new_cols = current_cols - saved_cols
+    missing_cols = saved_cols - current_cols
+
+    # Exclude system columns from drift detection
+    new_cols = {c for c in new_cols if not c.startswith('_')}
+    missing_cols = {c for c in missing_cols if not c.startswith('_')}
+
+    return {
+        'new_cols': new_cols,
+        'missing_cols': missing_cols,
+        'has_drift': bool(new_cols or missing_cols)
+    }
+
+
 def load_file(
     file_path: str,
     table_name: str,
@@ -99,12 +145,17 @@ def load_file(
     period: Optional[str] = None,
     sheet_name: Optional[str] = None,
     column_mappings: Optional[Dict[str, str]] = None,
+    sheet_mapping: Optional['SheetMapping'] = None,
 ) -> Tuple[int, Dict[str, str], Dict[str, str]]:
     """
     Load a file (Excel, CSV, or ZIP) to PostgreSQL.
 
     For ZIP files, extracts and loads the first data file found.
     Use extract_zip() for more control over which files to load.
+
+    Args:
+        sheet_mapping: Optional SheetMapping for drift detection. If provided,
+            new columns will be detected and added with identity mappings.
 
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
@@ -113,17 +164,17 @@ def load_file(
 
     if ext == '.csv':
         df = pd.read_csv(file_path, low_memory=False)
-        return load_dataframe(df, table_name, schema, period, column_mappings)
+        return load_dataframe(df, table_name, schema, period, column_mappings, sheet_mapping=sheet_mapping)
     elif ext in ['.xlsx', '.xls']:
         # Use FileExtractor for Excel files
-        return load_sheet(file_path, sheet_name or 0, table_name, schema, period, column_mappings)
+        return load_sheet(file_path, sheet_name or 0, table_name, schema, period, column_mappings, sheet_mapping)
     elif ext == '.zip':
         # Extract and load first data file
         extracted = extract_zip(file_path)
         if not extracted:
             raise ValueError(f"No data files (CSV/Excel) found in zip: {file_path}")
         # Load the first file found
-        return load_file(extracted[0], table_name, schema, period, sheet_name, column_mappings)
+        return load_file(extracted[0], table_name, schema, period, sheet_name, column_mappings, sheet_mapping)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
@@ -135,12 +186,18 @@ def load_sheet(
     schema: str = 'staging',
     period: Optional[str] = None,
     column_mappings: Optional[Dict[str, str]] = None,
+    sheet_mapping: Optional['SheetMapping'] = None,
 ) -> Tuple[int, Dict[str, str], Dict[str, str]]:
     """
     Load a specific Excel sheet to PostgreSQL using FileExtractor.
 
     CRITICAL: Uses FileExtractor for structure detection, then DataFrame as
     single source of truth for DDL and COPY (prevents column drift).
+
+    Args:
+        sheet_mapping: Optional SheetMapping for drift detection. If provided,
+            new columns will be detected and added with identity mappings.
+            The object is modified in place - caller should save config.
 
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
@@ -171,7 +228,7 @@ def load_sheet(
         for col_info in structure.columns.values():
             extractor_types[col_info.pg_name] = col_info.inferred_type
 
-        return load_dataframe(df, table_name, schema, period, column_mappings, extractor_types)
+        return load_dataframe(df, table_name, schema, period, column_mappings, extractor_types, sheet_mapping)
 
     except ValueError as e:
         if "not found" in str(e):
@@ -187,6 +244,7 @@ def load_dataframe(
     period: Optional[str] = None,
     column_mappings: Optional[Dict[str, str]] = None,
     extractor_types: Optional[Dict[str, str]] = None,
+    sheet_mapping: Optional['SheetMapping'] = None,
 ) -> Tuple[int, Dict[str, str], Dict[str, str]]:
     """
     Load a DataFrame to PostgreSQL.
@@ -204,12 +262,37 @@ def load_dataframe(
         period: Period string (e.g., "2024-11")
         column_mappings: Optional column name mappings
         extractor_types: Optional type hints from FileExtractor
+        sheet_mapping: Optional SheetMapping for drift detection.
+            If provided, new columns are detected and added with identity mappings.
+            The sheet_mapping object is modified in place (caller should save config).
 
     Returns:
         Tuple of (rows_loaded, final_column_mappings, column_types)
     """
     column_mappings = column_mappings or {}
     extractor_types = extractor_types or {}
+
+    # =========================================================
+    # DRIFT DETECTION: Compare against saved mappings
+    # =========================================================
+    if sheet_mapping and sheet_mapping.column_mappings:
+        drift = detect_column_drift(df.columns, sheet_mapping)
+
+        if drift['new_cols']:
+            console.print(f"[yellow]New columns detected: {drift['new_cols']}[/yellow]")
+            # Add identity mappings for new columns
+            for col in drift['new_cols']:
+                if col not in column_mappings:
+                    column_mappings[col] = col  # Identity mapping
+                    sheet_mapping.column_mappings[col] = col
+                    sheet_mapping.column_descriptions[col] = ""  # Empty = needs enrichment
+
+            sheet_mapping.mappings_version += 1
+            sheet_mapping.last_enriched = None  # Clear - new cols need enrichment
+            console.print(f"[dim]Mappings version bumped to {sheet_mapping.mappings_version}[/dim]")
+
+        if drift['missing_cols']:
+            console.print(f"[dim]Missing columns (removed in source): {drift['missing_cols']}[/dim]")
 
     # Skip empty DataFrames
     if df.empty:
@@ -307,6 +390,15 @@ def load_dataframe(
                     cur.execute(f'ALTER TABLE {full_table} ADD COLUMN "{col}" {pg_type}')
 
             # Prepare data for COPY
+            # Fix: Convert empty strings to NaN for numeric columns
+            # PostgreSQL COPY cannot convert "" to numeric types
+            numeric_type_prefixes = ('NUMERIC', 'DOUBLE', 'INTEGER', 'SMALLINT', 'BIGINT', 'REAL')
+            for col in df.columns:
+                pg_type = column_types.get(col, 'TEXT').upper()
+                if pg_type.startswith(numeric_type_prefixes):
+                    # Replace empty strings with NaN so they become \N in CSV
+                    df[col] = df[col].replace('', pd.NA)
+
             buffer = StringIO()
             df.to_csv(buffer, index=False, header=False, sep='\t', na_rep='\\N')
             buffer.seek(0)
@@ -365,10 +457,8 @@ def _infer_pg_type(series: pd.Series) -> str:
 
     # String types - check for patterns
     if pd.api.types.is_string_dtype(dtype) or dtype == object:
-        sample = non_null.head(100).astype(str)
-
-        # Check if all values are short (likely codes)
-        max_len = sample.str.len().max()
+        # Check max length on FULL column to avoid truncation errors
+        max_len = non_null.astype(str).str.len().max()
         if max_len <= 20:
             return 'VARCHAR(50)'
         elif max_len <= 100:
@@ -396,6 +486,7 @@ __all__ = [
     'load_file',
     'load_sheet',
     'load_dataframe',
+    'detect_column_drift',
     'preview_sheet',
     'get_sheet_names',
     'clear_workbook_cache',
