@@ -144,6 +144,21 @@ def classify_url(url: str) -> URLClassification:
 
     # Generate publication code
     path_parts = [p for p in urlparse(landing_page).path.split('/') if p]
+
+    # Check if last segment is a period (like "31-december-2025" or "january-2025")
+    # If so, use the previous segment as the publication code
+    from ..utils.period import parse_period
+    is_period_url = False
+    if path_parts:
+        last_segment = path_parts[-1]
+        if parse_period(last_segment):
+            is_period_url = True
+            # Use second-to-last segment as publication name
+            if len(path_parts) > 1:
+                path_parts = path_parts[:-1]
+                # Update landing_page to remove period segment
+                landing_page = landing_page.rsplit('/', 1)[0]
+
     if source == 'nhs_england' and 'statistical-work-areas' in path_parts:
         idx = path_parts.index('statistical-work-areas')
         code = path_parts[idx + 1] if idx + 1 < len(path_parts) else 'new_pub'

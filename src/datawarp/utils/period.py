@@ -1,6 +1,6 @@
 """Period parsing utilities - extract YYYY-MM from text"""
 import re
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from collections import defaultdict
 
 # Month name mappings
@@ -19,47 +19,84 @@ MONTHS = {
     'december': '12', 'dec': '12',
 }
 
-# Period patterns in priority order
-PERIOD_PATTERNS = [
-    # ISO format: 2024-11, 2024_11
-    (r'(\d{4})[-_](\d{2})(?!\d)', lambda m: f"{m.group(1)}-{m.group(2)}"),
-    # Month-year: november-2024, nov-2024, november_2024
-    (r'([a-z]+)[-_](\d{4})', lambda m: f"{m.group(2)}-{MONTHS.get(m.group(1).lower(), '00')}" if MONTHS.get(m.group(1).lower()) else None),
-    # Year-month name: 2024-november, 2024_nov
-    (r'(\d{4})[-_]([a-z]+)', lambda m: f"{m.group(1)}-{MONTHS.get(m.group(2).lower(), '00')}" if MONTHS.get(m.group(2).lower()) else None),
-    # Compact: 202411
-    (r'(\d{4})(\d{2})(?!\d)', lambda m: f"{m.group(1)}-{m.group(2)}" if 1 <= int(m.group(2)) <= 12 else None),
-    # Abbreviated: nov25, aug25, may25 (month + 2-digit year)
-    (r'([a-z]{3,9})(\d{2})(?!\d)', lambda m: f"20{m.group(2)}-{MONTHS.get(m.group(1).lower(), '00')}" if MONTHS.get(m.group(1).lower()) else None),
-]
+# Build regex for month names
+MONTH_PATTERN = '|'.join(sorted(MONTHS.keys(), key=len, reverse=True))
+
+
+def _extract_month_year(text: str) -> Optional[Tuple[str, str]]:
+    """Smart extraction of month and year from text.
+
+    Handles any order/format: "december 2025", "2025-12", "31-dec-2025", "122025", etc.
+    Returns (year, month) tuple or None.
+    """
+    text_lower = text.lower()
+
+    # Try to find month name
+    month_match = re.search(rf'({MONTH_PATTERN})', text_lower)
+    month_num = None
+
+    if month_match:
+        month_num = MONTHS.get(month_match.group(1))
+
+    # Try to find 4-digit year
+    year_match = re.search(r'(20[1-3]\d)', text_lower)
+    year = year_match.group(1) if year_match else None
+
+    # If we have both month name and year, we're done
+    if month_num and year:
+        return (year, month_num)
+
+    # Try compact formats: YYYYMM or MMYYYY
+    compact_match = re.search(r'(\d{6})', text_lower)
+    if compact_match:
+        digits = compact_match.group(1)
+        # Try YYYYMM first
+        if digits[:4].startswith('20') and 1 <= int(digits[4:6]) <= 12:
+            return (digits[:4], digits[4:6])
+        # Try MMYYYY
+        if digits[2:6].startswith('20') and 1 <= int(digits[:2]) <= 12:
+            return (digits[2:6], digits[:2])
+
+    # Try 2-digit year with month name (nov25)
+    if month_num:
+        short_year = re.search(r'(\d{2})(?!\d)', text_lower)
+        if short_year:
+            yr = int(short_year.group(1))
+            if 20 <= yr <= 35:  # 2020-2035
+                return (f"20{yr}", month_num)
+
+    # Try ISO format: 2024-11
+    iso_match = re.search(r'(20[1-3]\d)[-_/](\d{2})', text_lower)
+    if iso_match:
+        yr, mo = iso_match.groups()
+        if 1 <= int(mo) <= 12:
+            return (yr, mo)
+
+    return None
 
 
 def parse_period(text: str) -> Optional[str]:
     """
     Extract YYYY-MM period from text.
 
-    Handles:
-    - 2024-11, 2024_11
-    - november-2024, nov-2024
-    - 2024-november
-    - 202411
+    Handles flexibly:
+    - 2024-11, 2024_11, 2024/11
+    - november-2024, nov-2024, nov_2024
+    - december 2025 (space separator)
+    - 31-december-2025 (with day)
+    - 202411 (YYYYMM compact)
+    - 122025 (MMYYYY compact)
+    - nov25 (abbreviated)
 
     Returns None if no period found.
     """
     if not text:
         return None
 
-    text_lower = text.lower()
-
-    for pattern, extractor in PERIOD_PATTERNS:
-        match = re.search(pattern, text_lower, re.IGNORECASE)
-        if match:
-            result = extractor(match)
-            if result and result != "00":
-                # Validate month is 01-12
-                month = result.split('-')[1]
-                if 1 <= int(month) <= 12:
-                    return result
+    result = _extract_month_year(text)
+    if result:
+        year, month = result
+        return f"{year}-{month}"
 
     return None
 
@@ -71,6 +108,7 @@ def extract_period_from_url(url: str) -> Optional[str]:
     NHS URLs typically have periods in paths like:
     - /january-2025/
     - /december-2024/
+    - /31-december-2025/
     - /2024-11/
 
     We look at path segments only, not query strings or hash codes.
@@ -83,26 +121,15 @@ def extract_period_from_url(url: str) -> Optional[str]:
     path = parsed.path
 
     # Split into segments and check each one for period patterns
-    # Only match segments that look like period pages (month-year or year-month)
     segments = [s for s in path.split('/') if s]
 
     for segment in segments:
-        segment_lower = segment.lower()
-
-        # Pattern 1: month-year (january-2025, jan-2025)
-        match = re.match(r'^([a-z]+)-(\d{4})$', segment_lower)
-        if match:
-            month_str = match.group(1)
-            year = match.group(2)
-            if month_str in MONTHS and 2010 <= int(year) <= 2030:
-                return f"{year}-{MONTHS[month_str]}"
-
-        # Pattern 2: year-month (2025-01)
-        match = re.match(r'^(\d{4})-(\d{2})$', segment_lower)
-        if match:
-            year = match.group(1)
-            month = match.group(2)
-            if 2010 <= int(year) <= 2030 and 1 <= int(month) <= 12:
+        # Use the smart extraction on each segment
+        result = _extract_month_year(segment)
+        if result:
+            year, month = result
+            # Validate year is reasonable
+            if 2010 <= int(year) <= 2035:
                 return f"{year}-{month}"
 
     return None

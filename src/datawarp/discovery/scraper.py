@@ -2,7 +2,7 @@
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Set
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -108,7 +108,7 @@ def _scrape_page(url: str, inherit_period: Optional[str] = None) -> tuple[List[D
         # Check if it's a data file
         ext = _get_extension(path)
         if ext in DATA_EXTENSIONS:
-            filename = path.split('/')[-1]
+            filename = unquote(path.split('/')[-1])  # Decode %20 etc.
             title = _get_link_context(link)
             # Try filename first, then URL path, then link context, then inherit from page
             period = (parse_period(filename) or
