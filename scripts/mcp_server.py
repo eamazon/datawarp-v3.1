@@ -9,6 +9,7 @@ Tools:
     get_schema      - Get column metadata for a table
     query           - Execute SQL query
     get_periods     - Get available periods for a dataset
+    get_lineage     - Get data lineage: source, loads, enrichment history
 """
 import json
 import os
@@ -272,6 +273,102 @@ def get_periods(table_name: str, schema: str = 'staging') -> List[str]:
             return [row[0] for row in cur.fetchall()]
 
 
+def get_lineage(table_name: str) -> Dict:
+    """
+    Get complete lineage information for a table.
+
+    Returns:
+        - table_name: the table being queried
+        - source: pipeline_id, publication, landing_page, sheet_name, file_pattern
+        - loads: list of {period, file, rows, loaded_at} for each load
+        - enrichment: version, last_enriched, columns_enriched, columns_pending
+    """
+    # Find config for this table
+    configs = list_configs()
+    sheet_mapping = None
+    parent_config = None
+    file_pattern_info = None
+
+    for cfg in configs:
+        for fp in cfg.file_patterns:
+            for sm in fp.sheet_mappings:
+                if sm.table_name == table_name:
+                    sheet_mapping = sm
+                    parent_config = cfg
+                    file_pattern_info = fp
+                    break
+
+    # Build source info
+    if parent_config and sheet_mapping and file_pattern_info:
+        source = {
+            'pipeline_id': parent_config.pipeline_id,
+            'publication': parent_config.name,
+            'landing_page': parent_config.landing_page,
+            'sheet_name': sheet_mapping.sheet_pattern,
+            'file_pattern': file_pattern_info.filename_pattern,
+        }
+
+        # Calculate enrichment stats
+        total_cols = len(sheet_mapping.column_mappings)
+        enriched_cols = sum(1 for k, v in sheet_mapping.column_mappings.items() if k != v)
+        # Columns with empty descriptions need enrichment
+        pending_cols = sum(
+            1 for col in sheet_mapping.column_mappings.keys()
+            if not sheet_mapping.column_descriptions.get(col)
+            and not sheet_mapping.column_descriptions.get(sheet_mapping.column_mappings.get(col, col))
+        )
+
+        enrichment = {
+            'version': sheet_mapping.mappings_version,
+            'last_enriched': sheet_mapping.last_enriched,
+            'columns_total': total_cols,
+            'columns_enriched': enriched_cols,
+            'columns_pending': pending_cols,
+        }
+    else:
+        source = {
+            'pipeline_id': None,
+            'publication': None,
+            'landing_page': None,
+            'sheet_name': None,
+            'file_pattern': None,
+        }
+        enrichment = {
+            'version': None,
+            'last_enriched': None,
+            'columns_total': 0,
+            'columns_enriched': 0,
+            'columns_pending': 0,
+        }
+
+    # Get load history from database
+    loads = []
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT period, source_file, sheet_name, rows_loaded, loaded_at
+                FROM datawarp.tbl_load_history
+                WHERE table_name = %s
+                ORDER BY loaded_at DESC
+            """, (table_name,))
+
+            for row in cur.fetchall():
+                loads.append({
+                    'period': row[0],
+                    'file': row[1],
+                    'sheet': row[2],
+                    'rows': row[3],
+                    'loaded_at': row[4].isoformat() if row[4] else None,
+                })
+
+    return {
+        'table_name': table_name,
+        'source': source,
+        'loads': loads,
+        'enrichment': enrichment,
+    }
+
+
 def _infer_table_description(table_name: str) -> str:
     """Infer a description from table name."""
     # Remove tbl_ prefix
@@ -358,6 +455,17 @@ def handle_mcp_request(request: Dict) -> Dict:
                         'required': ['table_name']
                     }
                 },
+                {
+                    'name': 'get_lineage',
+                    'description': 'Get complete data lineage: source pipeline, publication, file patterns, load history, and enrichment status',
+                    'inputSchema': {
+                        'type': 'object',
+                        'properties': {
+                            'table_name': {'type': 'string'}
+                        },
+                        'required': ['table_name']
+                    }
+                },
             ]
         }
 
@@ -373,6 +481,8 @@ def handle_mcp_request(request: Dict) -> Dict:
             result = query(arguments['sql'], arguments.get('limit', 1000))
         elif tool_name == 'get_periods':
             result = get_periods(arguments['table_name'], arguments.get('schema', 'staging'))
+        elif tool_name == 'get_lineage':
+            result = get_lineage(arguments['table_name'])
         else:
             return {'error': f'Unknown tool: {tool_name}'}
 
@@ -458,6 +568,48 @@ def test_mode():
             console.print(f"Returned {result['row_count']} rows, {len(result['columns'])} columns")
             if result['rows']:
                 console.print(json.dumps(result['rows'][0], indent=2, default=str)[:500])
+
+    # Test lineage
+    if datasets:
+        console.print(f"\n[bold]4. get_lineage('{first_table}')[/]")
+        lineage = get_lineage(first_table)
+
+        source = lineage.get('source', {})
+        console.print(f"  [dim]Pipeline: {source.get('pipeline_id', 'N/A')}[/]")
+        console.print(f"  [dim]Publication: {source.get('publication', 'N/A')}[/]")
+        console.print(f"  [dim]Sheet: {source.get('sheet_name', 'N/A')}[/]")
+        console.print(f"  [dim]File pattern: {source.get('file_pattern', 'N/A')}[/]")
+
+        enrichment = lineage.get('enrichment', {})
+        console.print(f"  [dim]Enrichment: v{enrichment.get('version', '?')}, "
+                      f"{enrichment.get('columns_enriched', 0)}/{enrichment.get('columns_total', 0)} enriched, "
+                      f"{enrichment.get('columns_pending', 0)} pending[/]")
+
+        loads = lineage.get('loads', [])
+        if loads:
+            table = Table()
+            table.add_column("Period")
+            table.add_column("File")
+            table.add_column("Rows", justify="right")
+            table.add_column("Loaded At")
+
+            for load in loads[:5]:
+                loaded_at = load.get('loaded_at', '')
+                if loaded_at:
+                    loaded_at = loaded_at[:19]  # Truncate to datetime
+                table.add_row(
+                    load.get('period', '-'),
+                    (load.get('file', '-') or '-')[:40],
+                    str(load.get('rows', 0)),
+                    loaded_at
+                )
+
+            if len(loads) > 5:
+                table.add_row('...', '', '', f"({len(loads) - 5} more)")
+
+            console.print(table)
+        else:
+            console.print("  [yellow]No load history found[/]")
 
     console.print("\n[green]MCP server is ready![/]")
 
