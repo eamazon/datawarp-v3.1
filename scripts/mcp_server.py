@@ -12,32 +12,36 @@ Tools:
     get_lineage     - Get data lineage: source, loads, enrichment history
 """
 import json
+import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
+
 from datawarp.storage import get_connection
-from datawarp.metadata import get_table_metadata, get_all_tables_metadata
-from datawarp.pipeline import list_configs, load_config
+from datawarp.metadata import get_table_metadata
+from datawarp.pipeline import list_configs
+
+# Configure logging to stderr (stdout is reserved for MCP protocol)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger(__name__)
+
+# Create MCP server
+app = Server("datawarp-nhs")
 
 
 def list_datasets(schema: str = 'staging') -> List[Dict]:
-    """
-    List all available datasets with descriptions from saved configs.
-
-    Returns list of tables with:
-        - name: table name
-        - description: from LLM enrichment or heuristic
-        - grain: entity level (icb, trust, national)
-        - row_count: number of rows
-        - periods: list of available periods
-        - pipeline_id, publication_name, landing_page: source info
-        - has_enriched_columns: whether any columns have semantic names
-        - mappings_version: config version number
-    """
+    """List all available datasets with descriptions from saved configs."""
     results = []
 
     # Build mapping from saved configs (table_name -> (config, SheetMapping))
@@ -81,7 +85,6 @@ def list_datasets(schema: str = 'staging') -> List[Dict]:
                     desc = sm.table_description or _infer_table_description(table)
                     grain = sm.grain
                     grain_desc = sm.grain_description
-                    # Check if any columns have been enriched (semantic != original)
                     has_enriched = any(k != v for k, v in sm.column_mappings.items())
                     result = {
                         'name': table,
@@ -90,11 +93,9 @@ def list_datasets(schema: str = 'staging') -> List[Dict]:
                         'grain_description': grain_desc,
                         'row_count': row_count,
                         'periods': periods,
-                        # NEW: Publication context
                         'pipeline_id': cfg.pipeline_id,
                         'publication_name': cfg.name,
                         'landing_page': cfg.landing_page,
-                        # NEW: Enrichment metadata
                         'has_enriched_columns': has_enriched,
                         'mappings_version': sm.mappings_version,
                     }
@@ -119,20 +120,7 @@ def list_datasets(schema: str = 'staging') -> List[Dict]:
 
 
 def get_schema(table_name: str, schema: str = 'staging') -> Dict:
-    """
-    Get detailed schema information for a table.
-
-    Uses saved column descriptions from LLM enrichment if available.
-
-    Returns:
-        - table_name, description, grain, grain_description
-        - pipeline_id, publication_name, landing_page (source info)
-        - column_mappings: dict of original_name -> semantic_name
-        - mappings_version, last_enriched (version tracking)
-        - columns: list of {name, type, description, sample_values, original_name, is_enriched}
-        - row_count
-    """
-    # Find config for this table
+    """Get detailed schema information for a table."""
     configs = list_configs()
     sheet_mapping = None
     parent_config = None
@@ -144,56 +132,39 @@ def get_schema(table_name: str, schema: str = 'staging') -> Dict:
                     parent_config = cfg
                     break
 
-    # Get base metadata
     metadata = get_table_metadata(table_name, schema)
 
-    # Build reverse mapping: semantic_name -> original_name
     reverse_mappings = {}
     if sheet_mapping:
         reverse_mappings = {v: k for k, v in sheet_mapping.column_mappings.items()}
 
-    # Enhance with config descriptions
     if sheet_mapping and parent_config:
         metadata['description'] = sheet_mapping.table_description or metadata.get('description', '')
         metadata['grain'] = sheet_mapping.grain
         metadata['grain_description'] = sheet_mapping.grain_description
-
-        # NEW: Publication context
         metadata['pipeline_id'] = parent_config.pipeline_id
         metadata['publication_name'] = parent_config.name
         metadata['landing_page'] = parent_config.landing_page
-
-        # NEW: Column mappings (original -> semantic)
         metadata['column_mappings'] = sheet_mapping.column_mappings
-
-        # NEW: Version tracking
         metadata['mappings_version'] = sheet_mapping.mappings_version
         metadata['last_enriched'] = sheet_mapping.last_enriched
 
-        # Enhance each column with enrichment metadata
         for col in metadata.get('columns', []):
             col_name = col['name']
-
-            # Find original name (reverse lookup from semantic -> original)
             original_name = reverse_mappings.get(col_name, col_name)
             col['original_name'] = original_name
             col['is_enriched'] = original_name != col_name
-
-            # Get description - try semantic name first, then original
             if col_name in sheet_mapping.column_descriptions:
                 col['description'] = sheet_mapping.column_descriptions[col_name]
             elif original_name in sheet_mapping.column_descriptions:
                 col['description'] = sheet_mapping.column_descriptions[original_name]
     else:
-        # No config - add empty enrichment metadata
         metadata['pipeline_id'] = None
         metadata['publication_name'] = None
         metadata['landing_page'] = None
         metadata['column_mappings'] = {}
         metadata['mappings_version'] = None
         metadata['last_enriched'] = None
-
-        # Mark all columns as not enriched
         for col in metadata.get('columns', []):
             col['original_name'] = col['name']
             col['is_enriched'] = False
@@ -202,24 +173,11 @@ def get_schema(table_name: str, schema: str = 'staging') -> Dict:
 
 
 def query(sql: str, limit: int = 1000) -> Dict:
-    """
-    Execute a SQL query and return results.
-
-    Args:
-        sql: SQL query (SELECT only for safety)
-        limit: Maximum rows to return
-
-    Returns:
-        - columns: list of column names
-        - rows: list of row tuples
-        - row_count: number of rows returned
-    """
-    # Basic safety check - only allow SELECT
+    """Execute a SQL query and return results."""
     sql_upper = sql.strip().upper()
     if not sql_upper.startswith('SELECT'):
         return {'error': 'Only SELECT queries are allowed'}
 
-    # Add LIMIT if not present
     if 'LIMIT' not in sql_upper:
         sql = f"{sql.rstrip(';')} LIMIT {limit}"
 
@@ -230,12 +188,10 @@ def query(sql: str, limit: int = 1000) -> Dict:
                 columns = [desc[0] for desc in cur.description]
                 rows = cur.fetchall()
 
-                # Convert to JSON-serializable format
                 rows_serializable = []
                 for row in rows:
                     row_dict = {}
                     for i, val in enumerate(row):
-                        # Handle non-JSON-serializable types
                         if hasattr(val, 'isoformat'):
                             val = val.isoformat()
                         elif isinstance(val, (bytes, bytearray)):
@@ -253,14 +209,9 @@ def query(sql: str, limit: int = 1000) -> Dict:
 
 
 def get_periods(table_name: str, schema: str = 'staging') -> List[str]:
-    """
-    Get list of available periods for a table.
-
-    Returns empty list if table has no period column.
-    """
+    """Get list of available periods for a table."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # Check if period column exists
             cur.execute("""
                 SELECT column_name FROM information_schema.columns
                 WHERE table_schema = %s AND table_name = %s AND column_name = 'period'
@@ -274,16 +225,7 @@ def get_periods(table_name: str, schema: str = 'staging') -> List[str]:
 
 
 def get_lineage(table_name: str) -> Dict:
-    """
-    Get complete lineage information for a table.
-
-    Returns:
-        - table_name: the table being queried
-        - source: pipeline_id, publication, landing_page, sheet_name, file_pattern
-        - loads: list of {period, file, rows, loaded_at} for each load
-        - enrichment: version, last_enriched, columns_enriched, columns_pending
-    """
-    # Find config for this table
+    """Get complete lineage information for a table."""
     configs = list_configs()
     sheet_mapping = None
     parent_config = None
@@ -298,7 +240,6 @@ def get_lineage(table_name: str) -> Dict:
                     file_pattern_info = fp
                     break
 
-    # Build source info
     if parent_config and sheet_mapping and file_pattern_info:
         source = {
             'pipeline_id': parent_config.pipeline_id,
@@ -308,10 +249,8 @@ def get_lineage(table_name: str) -> Dict:
             'file_pattern': file_pattern_info.filename_pattern,
         }
 
-        # Calculate enrichment stats
         total_cols = len(sheet_mapping.column_mappings)
         enriched_cols = sum(1 for k, v in sheet_mapping.column_mappings.items() if k != v)
-        # Columns with empty descriptions need enrichment
         pending_cols = sum(
             1 for col in sheet_mapping.column_mappings.keys()
             if not sheet_mapping.column_descriptions.get(col)
@@ -341,7 +280,6 @@ def get_lineage(table_name: str) -> Dict:
             'columns_pending': 0,
         }
 
-    # Get load history from database
     loads = []
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -371,13 +309,9 @@ def get_lineage(table_name: str) -> Dict:
 
 def _infer_table_description(table_name: str) -> str:
     """Infer a description from table name."""
-    # Remove tbl_ prefix
     name = table_name.replace('tbl_', '')
-
-    # Split on underscore
     parts = name.split('_')
 
-    # Known patterns
     if 'adhd' in parts:
         base = 'ADHD referral data'
     elif 'waiting' in parts:
@@ -387,7 +321,6 @@ def _infer_table_description(table_name: str) -> str:
     else:
         base = ' '.join(parts).title() + ' data'
 
-    # Add level if present
     if 'icb' in parts:
         return f"{base} at ICB level"
     elif 'trust' in parts:
@@ -400,102 +333,127 @@ def _infer_table_description(table_name: str) -> str:
     return base
 
 
-# MCP Protocol Implementation
-def handle_mcp_request(request: Dict) -> Dict:
-    """Handle an MCP protocol request."""
-    method = request.get('method', '')
-    params = request.get('params', {})
+# MCP Tool Registration
+@app.list_tools()
+async def handle_list_tools() -> list[Tool]:
+    """List available tools."""
+    return [
+        Tool(
+            name="list_datasets",
+            description="List all NHS datasets with descriptions, grain, publication source, and enrichment status",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "default": "staging"}
+                }
+            }
+        ),
+        Tool(
+            name="get_schema",
+            description="Get column metadata including original/semantic name mappings, descriptions, and whether columns were LLM-enriched",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string"},
+                    "schema": {"type": "string", "default": "staging"}
+                },
+                "required": ["table_name"]
+            }
+        ),
+        Tool(
+            name="query",
+            description="Execute a SQL query against the NHS data",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string"},
+                    "limit": {"type": "integer", "default": 1000}
+                },
+                "required": ["sql"]
+            }
+        ),
+        Tool(
+            name="get_periods",
+            description="Get list of available time periods for a dataset",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string"},
+                    "schema": {"type": "string", "default": "staging"}
+                },
+                "required": ["table_name"]
+            }
+        ),
+        Tool(
+            name="get_lineage",
+            description="Get complete data lineage: source pipeline, publication, file patterns, load history, and enrichment status",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string"}
+                },
+                "required": ["table_name"]
+            }
+        ),
+    ]
 
-    if method == 'tools/list':
-        return {
-            'tools': [
-                {
-                    'name': 'list_datasets',
-                    'description': 'List all NHS datasets with descriptions, grain, publication source, and enrichment status',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'schema': {'type': 'string', 'default': 'staging'}
-                        }
-                    }
-                },
-                {
-                    'name': 'get_schema',
-                    'description': 'Get column metadata including original/semantic name mappings, descriptions, and whether columns were LLM-enriched',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'table_name': {'type': 'string'},
-                            'schema': {'type': 'string', 'default': 'staging'}
-                        },
-                        'required': ['table_name']
-                    }
-                },
-                {
-                    'name': 'query',
-                    'description': 'Execute a SQL query against the NHS data',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'sql': {'type': 'string'},
-                            'limit': {'type': 'integer', 'default': 1000}
-                        },
-                        'required': ['sql']
-                    }
-                },
-                {
-                    'name': 'get_periods',
-                    'description': 'Get list of available time periods for a dataset',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'table_name': {'type': 'string'},
-                            'schema': {'type': 'string', 'default': 'staging'}
-                        },
-                        'required': ['table_name']
-                    }
-                },
-                {
-                    'name': 'get_lineage',
-                    'description': 'Get complete data lineage: source pipeline, publication, file patterns, load history, and enrichment status',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'table_name': {'type': 'string'}
-                        },
-                        'required': ['table_name']
-                    }
-                },
-            ]
-        }
 
-    elif method == 'tools/call':
-        tool_name = params.get('name', '')
-        arguments = params.get('arguments', {})
+@app.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
+    """Handle tool calls."""
+    logger.info(f"Tool called: {name} with args: {arguments}")
 
-        if tool_name == 'list_datasets':
+    try:
+        if name == "list_datasets":
             result = list_datasets(arguments.get('schema', 'staging'))
-        elif tool_name == 'get_schema':
+        elif name == "get_schema":
             result = get_schema(arguments['table_name'], arguments.get('schema', 'staging'))
-        elif tool_name == 'query':
+        elif name == "query":
             result = query(arguments['sql'], arguments.get('limit', 1000))
-        elif tool_name == 'get_periods':
+        elif name == "get_periods":
             result = get_periods(arguments['table_name'], arguments.get('schema', 'staging'))
-        elif tool_name == 'get_lineage':
+        elif name == "get_lineage":
             result = get_lineage(arguments['table_name'])
         else:
-            return {'error': f'Unknown tool: {tool_name}'}
+            result = {'error': f'Unknown tool: {name}'}
 
-        return {'content': [{'type': 'text', 'text': json.dumps(result, indent=2, default=str)}]}
+        return [TextContent(
+            type="text",
+            text=json.dumps(result, indent=2, default=str)
+        )]
 
-    return {'error': f'Unknown method: {method}'}
+    except Exception as e:
+        logger.error(f"Error in tool {name}: {e}", exc_info=True)
+        return [TextContent(
+            type="text",
+            text=f"Error: {str(e)}"
+        )]
+
+
+async def main():
+    """Main entry point for stdio server."""
+    logger.info("DataWarp v3.1 MCP server starting...")
+
+    # Check database connection
+    try:
+        datasets = list_datasets()
+        logger.info(f"Database connected: {len(datasets)} tables available")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+
+    # Run the stdio server
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(
+            read_stream,
+            write_stream,
+            app.create_initialization_options()
+        )
 
 
 def test_mode():
     """Run in test mode - show what MCP would return."""
     from rich.console import Console
     from rich.table import Table
-    from rich.panel import Panel
 
     console = Console()
 
@@ -529,12 +487,10 @@ def test_mode():
 
         schema_info = get_schema(first_table)
 
-        # Show metadata summary
         console.print(f"  [dim]Pipeline: {schema_info.get('pipeline_id', 'N/A')}[/]")
         console.print(f"  [dim]Version: {schema_info.get('mappings_version', 'N/A')}[/]")
         console.print(f"  [dim]Last enriched: {schema_info.get('last_enriched', 'Never')}[/]")
 
-        # Show column_mappings if present
         mappings = schema_info.get('column_mappings', {})
         if mappings:
             enriched_count = sum(1 for k, v in mappings.items() if k != v)
@@ -557,21 +513,9 @@ def test_mode():
 
         console.print(table)
 
-    # Test query
-    if datasets:
-        console.print(f"\n[bold]3. query('SELECT * FROM staging.{first_table} LIMIT 3')[/]")
-        result = query(f"SELECT * FROM staging.{first_table} LIMIT 3")
-
-        if 'error' in result:
-            console.print(f"[red]Error: {result['error']}[/]")
-        else:
-            console.print(f"Returned {result['row_count']} rows, {len(result['columns'])} columns")
-            if result['rows']:
-                console.print(json.dumps(result['rows'][0], indent=2, default=str)[:500])
-
     # Test lineage
     if datasets:
-        console.print(f"\n[bold]4. get_lineage('{first_table}')[/]")
+        console.print(f"\n[bold]3. get_lineage('{first_table}')[/]")
         lineage = get_lineage(first_table)
 
         source = lineage.get('source', {})
@@ -596,7 +540,7 @@ def test_mode():
             for load in loads[:5]:
                 loaded_at = load.get('loaded_at', '')
                 if loaded_at:
-                    loaded_at = loaded_at[:19]  # Truncate to datetime
+                    loaded_at = loaded_at[:19]
                 table.add_row(
                     load.get('period', '-'),
                     (load.get('file', '-') or '-')[:40],
@@ -614,9 +558,9 @@ def test_mode():
     console.print("\n[green]MCP server is ready![/]")
 
 
-def main():
-    """Main entry point."""
+if __name__ == '__main__':
     import argparse
+    import asyncio
 
     parser = argparse.ArgumentParser(description='DataWarp MCP Server')
     parser.add_argument('--test', action='store_true', help='Run in test mode')
@@ -626,21 +570,7 @@ def main():
     if args.test:
         test_mode()
     elif args.stdio:
-        # MCP stdio mode - read JSON-RPC from stdin, write to stdout
-        import sys
-        for line in sys.stdin:
-            try:
-                request = json.loads(line)
-                response = handle_mcp_request(request)
-                print(json.dumps(response))
-                sys.stdout.flush()
-            except json.JSONDecodeError:
-                print(json.dumps({'error': 'Invalid JSON'}))
-                sys.stdout.flush()
+        asyncio.run(main())
     else:
-        # Default: show help
-        parser.print_help()
-
-
-if __name__ == '__main__':
-    main()
+        # Default: run as stdio server (for Claude Desktop)
+        asyncio.run(main())
