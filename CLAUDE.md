@@ -177,6 +177,57 @@ export LLM_MODEL=gemini-2.0-flash-exp
 
 ---
 
+## Lessons Learned (Code Quality)
+
+These patterns caused problems in this codebase. **Enforce in new code:**
+
+### 1. Check Before You Write
+Before writing ANY of these, search if it already exists:
+- Type inference → check `loader/excel.py:_infer_pg_type()`
+- Column sanitization → use `utils/sanitize.py:sanitize_name()`
+- HTTP requests → check `discovery/scraper.py`
+- Period parsing → use `utils/period.py:parse_period()`
+
+**Rule:** `grep -r "def <function_name>" src/` before creating new utilities.
+
+### 2. One File, One Purpose
+Every file's docstring must state its SINGLE responsibility:
+```python
+"""Load DataFrames to PostgreSQL. Nothing else."""  # GOOD
+"""Handle Excel files and CSVs and downloads and types."""  # BAD - split it
+```
+
+**Rule:** If docstring has "and", the file does too much.
+
+### 3. Watch File Growth
+When adding to a file:
+1. Check current line count: `wc -l <file>`
+2. If > 250 lines, consider if new code belongs elsewhere
+3. If > 300 lines, MUST split before adding more
+
+**Rule:** Never add features to files already over 250 lines.
+
+### 4. Functions Stay Small
+- Max 50 lines per function (excluding docstrings)
+- If function has more than 2 levels of nesting, extract helper
+- If function has comments like "# Step 1", "# Step 2" → split into functions
+
+### 5. Don't Duplicate, Import
+Common duplications to avoid:
+| Need | Use | Don't Recreate |
+|------|-----|----------------|
+| Sanitize column name | `sanitize_name()` | Custom regex |
+| Parse period string | `parse_period()` | Date parsing logic |
+| DB connection | `get_connection()` | New connection code |
+| Console output | `console` from cli | Print statements |
+
+### 6. Keep Working Code Working
+- Don't refactor code that works unless you have a specific bug or feature blocked
+- Add tests BEFORE refactoring, not after
+- "Clean code" that breaks functionality is not clean
+
+---
+
 ## Red Flags - Stop and Reassess
 
 - Creating new database tables beyond the 3 config tables
@@ -185,6 +236,39 @@ export LLM_MODEL=gemini-2.0-flash-exp
 - Tests passing without asserting row counts
 - Swallowing exceptions silently
 - Database changes in code without updating `sql/schema.sql`
+- Writing a utility function without checking if it exists
+- Adding to a file that's already over 250 lines
+
+---
+
+## Existing Utilities (Use These, Don't Recreate)
+
+```python
+# Column/name handling
+from datawarp.utils.sanitize import sanitize_name, make_table_name
+
+# Period parsing
+from datawarp.utils.period import parse_period, normalize_period
+
+# Database
+from datawarp.storage import get_connection
+
+# File loading
+from datawarp.loader import load_file, load_sheet, load_dataframe, download_file
+from datawarp.loader import detect_column_drift  # For schema drift detection
+from datawarp.loader.extractor import FileExtractor, get_sheet_names
+
+# Metadata
+from datawarp.metadata import detect_grain, enrich_sheet, get_table_metadata
+
+# Pipeline config
+from datawarp.pipeline import load_config, save_config, list_configs, record_load
+
+# CLI
+from datawarp.cli.console import console  # Rich console for output
+```
+
+**Before writing new code, check if these solve your problem.**
 
 ---
 
