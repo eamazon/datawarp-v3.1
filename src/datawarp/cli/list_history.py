@@ -19,15 +19,15 @@ def list_command():
         tracker['pipeline_count'] = len(configs)
 
         if not configs:
-            console.print("[yellow]No pipelines registered yet[/]")
+            console.print("[warning]No pipelines registered yet[/]")
             console.print("Run: python scripts/pipeline.py bootstrap --url <NHS_URL>")
             return
 
-        table = Table(title="Registered Pipelines")
-        table.add_column("ID", style="bold white")
-        table.add_column("Name")
-        table.add_column("Periods Loaded", justify="right")
-        table.add_column("Auto-load")
+        table = Table(title="Registered Pipelines", header_style="bold blue")
+        table.add_column("ID", style="blue")
+        table.add_column("Name", style="blue")
+        table.add_column("Periods Loaded", justify="right", style="blue")
+        table.add_column("Auto-load", style="blue")
 
         for c in configs:
             table.add_row(
@@ -47,22 +47,22 @@ def history_command(pipeline: str):
     with track_run('history', {'pipeline': pipeline}, pipeline) as tracker:
         config = load_config(pipeline)
         if not config:
-            console.print(f"[red]Pipeline '{pipeline}' not found[/]")
+            console.print(f"[error]Pipeline '{pipeline}' not found[/]")
             return
 
         records = get_load_history(pipeline)
         tracker['record_count'] = len(records)
 
         if not records:
-            console.print(f"[yellow]No load history for '{pipeline}'[/]")
+            console.print(f"[warning]No load history for '{pipeline}'[/]")
             return
 
-        table = Table(title=f"Load History: {config.name}")
-        table.add_column("Period", style="bold white")
-        table.add_column("Table")
-        table.add_column("Sheet")
-        table.add_column("Rows", justify="right")
-        table.add_column("Loaded At")
+        table = Table(title=f"Load History: {config.name}", header_style="bold blue")
+        table.add_column("Period", style="blue")
+        table.add_column("Table", style="blue")
+        table.add_column("Sheet", style="blue")
+        table.add_column("Rows", justify="right", style="blue")
+        table.add_column("Loaded At", style="blue")
 
         for r in records:
             table.add_row(

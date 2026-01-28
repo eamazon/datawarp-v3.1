@@ -60,19 +60,19 @@ def analyze_sheets(local_path: str, sheets: List[str]) -> List[dict]:
 
 def display_sheet_table(previews: List[dict], filename: str) -> None:
     """Display a table of sheets with their properties."""
-    table = Table(title=f"Sheets in {unquote(filename)}")
-    table.add_column("#", style="dim", width=3)
-    table.add_column("Sheet Name", style="bold white")
-    table.add_column("Grain", style="green")
-    table.add_column("Rows", justify="right")
-    table.add_column("Cols", justify="right")
-    table.add_column("Description")
+    table = Table(title=f"Sheets in {unquote(filename)}", header_style="bold blue")
+    table.add_column("#", style="blue", width=3)
+    table.add_column("Sheet Name", style="blue")
+    table.add_column("Grain", style="blue")
+    table.add_column("Rows", justify="right", style="blue")
+    table.add_column("Cols", justify="right", style="blue")
+    table.add_column("Description", style="blue")
 
     for i, sp in enumerate(previews, 1):
-        grain_style = "green" if sp['grain'] not in ('unknown', 'empty', 'invalid', 'error') else "dim"
+        grain_style = "blue" if sp['grain'] not in ('unknown', 'empty', 'invalid', 'error') else "dim blue"
         is_data = sp['grain'] not in ('empty', 'invalid', 'error') and sp['rows'] > 0
         table.add_row(
-            str(i) if is_data else f"[dim]{i}[/]", sp['name'],
+            str(i) if is_data else f"[muted]{i}[/]", sp['name'],
             f"[{grain_style}]{sp['grain']}[/]",
             str(sp['rows']) if sp['rows'] > 0 else "-",
             str(sp['cols']) if sp['cols'] > 0 else "-",
@@ -85,7 +85,7 @@ def display_sheet_table(previews: List[dict], filename: str) -> None:
     known = [sp for sp in previews if sp['grain'] in entity_grains and sp['rows'] > 0]
     national = [sp for sp in previews if sp['grain'] in ('unknown', 'national') and sp['rows'] > 0]
     skipped = [sp for sp in previews if sp['grain'] in ('empty', 'invalid', 'error')]
-    console.print(f"\n  [green]{len(known)} with entity[/], [yellow]{len(national)} national/unknown[/], [dim]{len(skipped)} skipped[/]")
+    console.print(f"\n  [success]{len(known)} with entity[/], [warning]{len(national)} national/unknown[/], [muted]{len(skipped)} skipped[/]")
 
 
 def select_sheets(previews: List[dict], skip_unknown: bool) -> List[dict]:
@@ -108,8 +108,8 @@ def select_sheets(previews: List[dict], skip_unknown: bool) -> List[dict]:
         hint = "Defaulting to sheets with detected entities (ICB/Trust/etc)"
     elif national_indices:
         if skip_unknown:
-            console.print("\n  [yellow]Warning: All sheets have national/unknown entities[/]")
-            console.print("  [dim]To load anyway, re-run with: --no-skip-unknown[/]\n")
+            console.print("\n  [warning]Warning: All sheets have national/unknown entities[/]")
+            console.print("  [muted]To load anyway, re-run with: --no-skip-unknown[/]\n")
             default_indices = []
             hint = None
         else:
@@ -121,7 +121,7 @@ def select_sheets(previews: List[dict], skip_unknown: bool) -> List[dict]:
         hint = "No data sheets found"
 
     if hint:
-        console.print(f"  [dim]{hint}[/]")
+        console.print(f"  [muted]{hint}[/]")
 
     default_str = ','.join(map(str, default_indices)) if default_indices else ''
     selection = Prompt.ask(f"\n  Select sheets (numbers, 'all', or enter for default)", default=default_str)

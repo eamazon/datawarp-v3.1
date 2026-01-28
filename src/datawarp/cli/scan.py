@@ -39,28 +39,28 @@ def _scan_impl(pipeline: str, dry_run: bool, force_scrape: bool, tracker: dict):
     """Implementation of scan command."""
     config = load_config(pipeline)
     if not config:
-        console.print(f"[red]Pipeline '{pipeline}' not found[/]")
+        console.print(f"[error]Pipeline '{pipeline}' not found[/]")
         return
 
-    console.print(f"\n[bold blue]Scanning:[/] {config.name}")
-    console.print(f"[dim]URL: {config.landing_page}[/]")
-    console.print(f"[dim]Discovery mode: {config.discovery_mode}[/]\n")
+    console.print(f"\n[info]Scanning:[/] {config.name}")
+    console.print(f"[muted]URL: {config.landing_page}[/]")
+    console.print(f"[muted]Discovery mode: {config.discovery_mode}[/]\n")
 
     # Handle explicit mode
     if config.discovery_mode == 'explicit':
-        console.print("[yellow]This pipeline uses explicit mode - URLs must be added manually.[/]")
+        console.print("[warning]This pipeline uses explicit mode - URLs must be added manually.[/]")
         return
 
     # Discover current files based on mode
     files = []
     if config.discovery_mode == 'template' and config.url_pattern and not force_scrape:
         # Template mode: generate period URLs and probe for files
-        console.print(f"[dim]Template: {config.url_pattern}[/]")
+        console.print(f"[muted]Template: {config.url_pattern}[/]")
         files = _discover_via_template(config)
 
         if not files:
             # Fallback to scraping if template discovery fails
-            console.print("[dim]Template discovery found no files, falling back to scrape...[/]")
+            console.print("[muted]Template discovery found no files, falling back to scrape...[/]")
             with console.status("Scraping landing page..."):
                 files = scrape_landing_page(config.landing_page)
     else:
@@ -75,20 +75,20 @@ def _scan_impl(pipeline: str, dry_run: bool, force_scrape: bool, tracker: dict):
     new_periods = config.get_new_periods(available)
 
     if not new_periods:
-        console.print("[green]No new periods found - up to date![/]")
+        console.print("[success]No new periods found - up to date![/]")
         return
 
-    console.print(f"[yellow]Found {len(new_periods)} new period(s):[/] {', '.join(sorted(new_periods))}")
+    console.print(f"[warning]Found {len(new_periods)} new period(s):[/] {', '.join(sorted(new_periods))}")
 
     if dry_run:
-        console.print("\n[dim]Dry run - no data loaded[/]")
+        console.print("\n[muted]Dry run - no data loaded[/]")
         return
 
     # Load each new period
     temp_dir = tempfile.mkdtemp()
 
     for period in sorted(new_periods):
-        console.print(f"\n[bold cyan]Loading period: {period}[/]")
+        console.print(f"\n[highlight]Loading period: {period}[/]")
 
         period_files = [item['file'] for item in by_period[period]]
 
@@ -104,7 +104,7 @@ def _scan_impl(pipeline: str, dry_run: bool, force_scrape: bool, tracker: dict):
     tracker['periods_loaded'] = list(new_periods)
     tracker['periods_count'] = len(new_periods)
 
-    console.print(f"\n[green]Scan complete - loaded {len(new_periods)} period(s)[/]")
+    console.print(f"\n[success]Scan complete - loaded {len(new_periods)} period(s)[/]")
 
 
 def _discover_via_template(config) -> List:
@@ -145,15 +145,15 @@ def _discover_via_template(config) -> List:
                     files = scrape_landing_page(url)
                     if files:
                         discovered.extend(files)
-                        console.print(f"  [green]o[/] {url.split('/')[-1]}: {len(files)} files")
+                        console.print(f"  [success]o[/] {url.split('/')[-1]}: {len(files)} files")
                     else:
-                        console.print(f"  [yellow]o[/] {url.split('/')[-1]}: page exists but no files")
+                        console.print(f"  [warning]o[/] {url.split('/')[-1]}: page exists but no files")
                 elif resp.status_code == 404:
                     # Period doesn't exist yet - expected for future months
-                    console.print(f"  [dim]x {url.split('/')[-1]}: not found[/]")
+                    console.print(f"  [muted]x {url.split('/')[-1]}: not found[/]")
                 else:
-                    console.print(f"  [dim]? {url.split('/')[-1]}: HTTP {resp.status_code}[/]")
+                    console.print(f"  [muted]? {url.split('/')[-1]}: HTTP {resp.status_code}[/]")
             except requests.RequestException as e:
-                console.print(f"  [red]! {url.split('/')[-1]}: {e}[/]")
+                console.print(f"  [error]! {url.split('/')[-1]}: {e}[/]")
 
     return discovered

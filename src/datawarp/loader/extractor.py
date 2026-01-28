@@ -495,7 +495,9 @@ class FileExtractor:
 
         if any(x in name_lower for x in ['date', 'month', 'year', 'quarter', 'period']):
             return 'VARCHAR(255)'
-        if any(x in name_lower for x in ['name', 'description', 'category', 'group', 'trust', 'type']):
+        if any(x in name_lower for x in ['description', 'definition', 'notes', 'comment', 'detail']):
+            return 'TEXT'  # Descriptions can be very long
+        if any(x in name_lower for x in ['name', 'category', 'group', 'trust', 'type']):
             return 'VARCHAR(255)'
         if any(x in name_lower for x in ['code', 'org', 'ics', 'nhse']):
             return 'VARCHAR(20)'

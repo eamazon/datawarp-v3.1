@@ -1,36 +1,79 @@
 # Current Tasks - DataWarp v3.1
 
-**Last Updated:** 2025-01-27 20:00
+**Last Updated:** 2025-01-28 Session End
 
 ---
 
-## Session Summary (2025-01-27)
+## Session Summary (2025-01-28)
 
 ### Completed This Session
 
-1. **Enrichment Logging** - Added `tbl_enrichment_log` table to track LLM calls
-   - Logs: pipeline_id, source_file, sheet_name, provider, model
-   - Logs: prompt_text, response_text, tokens, duration_ms
-   - Logs: suggested_table_name, suggested_columns, success/error
+1. **CLI Refactoring** - Moved 1178-line pipeline.py into modular CLI structure
+   - `src/datawarp/cli/bootstrap.py` - Bootstrap command
+   - `src/datawarp/cli/scan.py` - Scan command
+   - `src/datawarp/cli/backfill.py` - Backfill command
+   - `src/datawarp/cli/list_history.py` - List and history commands
+   - `src/datawarp/cli/console.py` - Shared Rich console with theme
+   - `src/datawarp/cli/helpers.py` - Shared utilities
+   - `src/datawarp/cli/file_processor.py` - File processing logic
+   - `src/datawarp/cli/sheet_selector.py` - Sheet analysis UI
 
-2. **Fixed Table Names** - LLM names now used directly (not combined with pipeline_id)
-   - Before: `tbl_patients_registered_at_a_gp_practice_gp_practice_patient_list`
-   - After: `tbl_gp_patients`
-   - Updated LLM prompt to request short names (max 30 chars)
+2. **Console Colors** - Fixed for light terminal backgrounds
+   - All colors now dark blue for readability
+   - Disabled Rich auto-highlighter that was causing cyan dates
 
-3. **Metadata Views** - Created 4 views for easy metadata querying
-   - `v_tables` - All tables with metadata + stats
-   - `v_table_metadata` - Table descriptions, grain, column mappings
-   - `v_column_metadata` - Column-level descriptions
-   - `v_table_stats` - Load statistics per table
+3. **Period URL Detection** - Fixed classifier for complex period URLs
+   - URLs like `/final-october-2025-provisional-november-2025-official-statistics` now detected
+   - Scrapes specific period URL instead of entire landing page
 
-4. **Documentation Refresh**
-   - Updated `CLAUDE.md` - Reflects current state, not outdated MVP spec
-   - Created `docs/ARCHITECTURE.md` - System design and data flow
-   - Created `docs/DATABASE_SPEC.md` - Complete schema documentation
-   - Created `docs/USER_GUIDE.md` - CLI cheat sheet + SQL queries
+4. **Existing Pipeline Detection** - Bootstrap now checks if pipeline exists
+   - Shows loaded periods and suggests using `scan` command
+   - Asks for confirmation before re-bootstrapping
 
-5. **DType Warning Fix** - Added `low_memory=False` to CSV reads
+5. **Multi-Period Selection** - When ≤3 periods, offers "all" option
+   - Can load files from multiple periods in one bootstrap
+   - Each file uses its own detected period
+
+6. **Column Type Fix** - Description columns now use TEXT not VARCHAR(255)
+   - Fixed truncation errors for long text fields
+
+7. **Smart Period Replace** - Loader deletes existing period data before insert
+   - Prevents duplicate rows when re-loading same period
+
+8. **Tables Created vs Updated** - Summary now distinguishes new vs existing tables
+
+---
+
+## Pending Task: Multi-Period File Pattern Matching (Task #31)
+
+### Problem
+When bootstrapping 6 files (3 Oct + 3 Nov with same schemas), creates 6 tables instead of 3.
+
+### Root Cause
+Bootstrap processes each file independently instead of grouping by file type first.
+
+### Recommended Solution: Hybrid Deterministic Approach
+
+```
+1. FILENAME GROUPING (deterministic)
+   Extract type: "msds-oct2025-exp-data.csv" → "data"
+   Group: {data: [oct, nov], measures: [...], dq: [...]}
+
+2. SCHEMA VALIDATION (safety check)
+   Verify files in each group have matching columns
+
+3. LLM ENRICHMENT (where it adds value)
+   Enrich ONE file per group, apply mapping to all
+```
+
+### Why NOT Two-Phase LLM
+- NHS filenames follow predictable conventions
+- Deterministic grouping is faster, cheaper, more reliable
+- LLM only where it adds unique value (semantic naming)
+
+### Implementation
+- Refactor `_bootstrap_impl` to group files before processing
+- Add `src/datawarp/cli/file_grouper.py` for grouping logic
 
 ---
 
@@ -42,26 +85,16 @@
 | Period Detection | ✅ Working |
 | Grain Detection | ✅ Working |
 | LLM Enrichment | ✅ Working |
-| Enrichment Logging | ✅ Working |
 | Data Loading | ✅ Working |
-| Metadata Views | ✅ Working |
-| MCP Server | ✅ Working |
+| CLI Modular Structure | ✅ Working |
+| Multi-Period Bootstrap | ⚠️ Creates too many tables |
 
 ---
 
-## Next Session
+## Next Session Priority
 
-### Priority Tasks
-
-1. **Test GP Registrations** - Run bootstrap with `--enrich` to verify short table names
-2. **Test Multi-Period** - Verify scan appends to existing tables correctly
-3. **MCP Integration Test** - Verify Claude can query metadata via MCP
-
-### Queued (Pick 0-1)
-
-- [ ] Add cost calculation to enrichment logging (based on token counts)
-- [ ] Add schema drift detection (new columns in subsequent periods)
-- [ ] Add data quality checks (null counts, duplicate detection)
+1. **Implement Task #31** - File pattern grouping for multi-period bootstrap
+2. **Test** - Verify 6 files → 3 tables with maternity data
 
 ---
 
@@ -69,17 +102,15 @@
 
 ```
 Modified:
-- CLAUDE.md (complete rewrite)
-- sql/schema.sql (added enrichment_log, metadata views)
-- src/datawarp/metadata/enrich.py (logging, shorter prompts)
-- src/datawarp/loader/excel.py (low_memory=False)
-- scripts/pipeline.py (fixed table naming, enrichment params)
+- scripts/pipeline.py (reduced to thin CLI entry point)
+- src/datawarp/cli/*.py (all CLI modules)
+- src/datawarp/loader/excel.py (period replace, TEXT for descriptions)
+- src/datawarp/loader/extractor.py (TEXT for description columns)
+- src/datawarp/discovery/classifier.py (period URL detection fix)
+- src/datawarp/metadata/enrich.py (reverted band-aid changes)
 
 Created:
-- docs/ARCHITECTURE.md
-- docs/DATABASE_SPEC.md
-- docs/USER_GUIDE.md
-- docs/tasks/CURRENT.md
+- src/datawarp/tracking.py (run tracking)
 ```
 
 ---
@@ -87,16 +118,14 @@ Created:
 ## Quick Start Next Session
 
 ```bash
-# 1. Check git status
 cd /Users/speddi/projectx/datawarp-v3.1
 git status
 
-# 2. Test bootstrap with enrichment
-PYTHONPATH=src python scripts/pipeline.py bootstrap \
-  --url "https://digital.nhs.uk/.../patients-registered-at-a-gp-practice/january-2026" \
-  --id gp_reg \
-  --enrich
+# Read Task #31 for context
+cat docs/tasks/CURRENT.md
 
-# 3. Check metadata
-psql -d datawalker -c "SELECT * FROM datawarp.v_tables;"
+# Test current state
+python scripts/pipeline.py bootstrap \
+  --url https://digital.nhs.uk/.../maternity-services-monthly-statistics/final-october-2025-provisional-november-2025-official-statistics \
+  --enrich
 ```

@@ -389,6 +389,16 @@ def load_dataframe(
                     pg_type = column_types.get(col, 'TEXT')
                     cur.execute(f'ALTER TABLE {full_table} ADD COLUMN "{col}" {pg_type}')
 
+            # =========================================================
+            # SMART REPLACE: Delete existing data for this period
+            # If period is provided and table has period column, replace not append
+            # =========================================================
+            if period and 'period' in existing_cols:
+                cur.execute(f'DELETE FROM {full_table} WHERE period = %s', (period,))
+                deleted = cur.rowcount
+                if deleted > 0:
+                    console.print(f"[blue]Replacing {deleted} existing rows for period {period}[/]")
+
             # Prepare data for COPY
             # Fix: Convert empty strings to NaN for numeric columns
             # PostgreSQL COPY cannot convert "" to numeric types
@@ -426,6 +436,11 @@ def _infer_pg_type(series: pd.Series) -> str:
 
     Conservative approach - use TEXT for ambiguous cases.
     """
+    # Check column name for hints - descriptions should always be TEXT
+    col_name = series.name.lower() if series.name else ''
+    if any(x in col_name for x in ['description', 'definition', 'notes', 'comment', 'detail']):
+        return 'TEXT'
+
     # Drop nulls for type inference
     non_null = series.dropna()
 

@@ -42,7 +42,7 @@ def _enrich_and_load(
 
     if enrich:
         if is_csv:
-            console.print("  [yellow]Enriching with LLM...[/]")
+            console.print("  [warning]Enriching with LLM...[/]")
         enriched = enrich_sheet(
             sheet_name=sheet_name, columns=sanitized_cols,
             sample_rows=df.head(3).to_dict('records'),
@@ -53,7 +53,7 @@ def _enrich_and_load(
         table_desc = enriched['table_description']
         col_mappings = enriched['columns']
         col_descriptions = enriched['descriptions']
-        console.print(f"{'  ' if is_csv else '    '}[green]LLM suggested: {table_name}[/]")
+        console.print(f"{'  ' if is_csv else '    '}[success]LLM suggested: {table_name}[/]")
 
     # Load data
     if is_csv:
@@ -90,7 +90,7 @@ def process_data_file(
     results = []
 
     if file_type == 'zip':
-        console.print("  [dim]Extracting ZIP contents...[/]")
+        console.print("  [muted]Extracting ZIP contents...[/]")
         zip_contents = list_zip_contents(local_path)
         console.print(f"  Found {len(zip_contents)} data files in ZIP")
 
@@ -119,14 +119,14 @@ def process_data_file(
                 if result:
                     results.append((result, rows))
             except Exception as e:
-                console.print(f"    [dim]{sheet}: skipped ({e})[/]")
+                console.print(f"    [muted]{sheet}: skipped ({e})[/]")
         return results
 
     else:  # CSV
         try:
             df = pd.read_csv(local_path, low_memory=False)
         except Exception as e:
-            console.print(f"  [red]Error reading: {e}[/]")
+            console.print(f"  [error]Error reading: {e}[/]")
             return results
 
         sheet_name = os.path.splitext(filename)[0]
@@ -155,7 +155,7 @@ def load_period_files(
         matching = [f for f in period_files if re.match(fp.filename_pattern, f.filename, re.IGNORECASE)]
 
         if not matching:
-            console.print(f"  [yellow]No file matching pattern: {fp.filename_pattern}[/]")
+            console.print(f"  [warning]No file matching pattern: {fp.filename_pattern}[/]")
             continue
 
         for f in matching:
@@ -187,15 +187,15 @@ def load_period_files(
                     config_modified = True
 
                 if rows > 0:
-                    console.print(f"    [green]{sm.table_name}: {rows} rows[/]")
+                    console.print(f"    [success]{sm.table_name}: {rows} rows[/]")
                     record_load(config.pipeline_id, period, sm.table_name, f.filename, sm.sheet_pattern, rows)
                     results.append((sm.table_name, rows))
                 else:
-                    console.print(f"    [dim]{sm.table_name}: skipped (sheet not found)[/]")
+                    console.print(f"    [muted]{sm.table_name}: skipped (sheet not found)[/]")
 
     # Save config if drift was detected (new columns added)
     if config_modified:
-        console.print("[yellow]Config updated with new column mappings[/]")
+        console.print("[warning]Config updated with new column mappings[/]")
         save_config(config)
 
     return results

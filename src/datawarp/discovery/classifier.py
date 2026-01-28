@@ -209,7 +209,9 @@ def classify_url(url: str) -> URLClassification:
         period_from = f"{period_info[0]}-{period_info[1]:02d}"
 
     # Detect if user gave a period-specific URL (e.g., /january-2026)
-    is_period_url = period_info is not None and url.rstrip('/') != landing_page.rstrip('/')
+    # Don't overwrite if already detected from path segment check above
+    if not is_period_url:
+        is_period_url = period_info is not None and url.rstrip('/') != landing_page.rstrip('/')
 
     return URLClassification(
         publication_id=code,

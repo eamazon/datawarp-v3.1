@@ -35,10 +35,10 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
     """Implementation of backfill command."""
     config = load_config(pipeline)
     if not config:
-        console.print(f"[red]Pipeline '{pipeline}' not found[/]")
+        console.print(f"[error]Pipeline '{pipeline}' not found[/]")
         return
 
-    console.print(f"\n[bold blue]Backfilling:[/] {config.name}")
+    console.print(f"\n[info]Backfilling:[/] {config.name}")
 
     # Discover all files
     with console.status("Scraping landing page..."):
@@ -57,10 +57,10 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
     unloaded = config.get_new_periods(available)
 
     if not unloaded:
-        console.print("[green]All periods already loaded![/]")
+        console.print("[success]All periods already loaded![/]")
         return
 
-    console.print(f"[yellow]Will load {len(unloaded)} period(s)[/]")
+    console.print(f"[warning]Will load {len(unloaded)} period(s)[/]")
 
     if not Confirm.ask("Continue?", default=True):
         return
@@ -70,7 +70,7 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
     total_loaded = 0
 
     for period in sorted(unloaded):
-        console.print(f"\n[bold cyan]Loading period: {period}[/]")
+        console.print(f"\n[highlight]Loading period: {period}[/]")
 
         period_files = [item['file'] for item in by_period[period]]
         results = load_period_files(config, period, period_files, temp_dir, console)
@@ -86,4 +86,4 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
     tracker['periods_count'] = len(unloaded)
     tracker['total_rows'] = total_loaded
 
-    console.print(f"\n[green]Backfill complete - loaded {len(unloaded)} period(s)[/]")
+    console.print(f"\n[success]Backfill complete - loaded {len(unloaded)} period(s)[/]")

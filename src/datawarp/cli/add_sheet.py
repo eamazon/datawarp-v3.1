@@ -39,17 +39,17 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
     """
     config = load_config(pipeline)
     if not config:
-        console.print(f"[red]Pipeline '{pipeline}' not found[/]")
+        console.print(f"[error]Pipeline '{pipeline}' not found[/]")
         return
 
-    console.print(f"\n[bold blue]Adding sheet to:[/] {config.name}")
-    console.print(f"[dim]Sheet: {sheet}[/]\n")
+    console.print(f"\n[info]Adding sheet to:[/] {config.name}")
+    console.print(f"[muted]Sheet: {sheet}[/]\n")
 
     # Check if sheet already exists in config
     for fp in config.file_patterns:
         for sm in fp.sheet_mappings:
             if sm.sheet_pattern == sheet:
-                console.print(f"[yellow]Sheet '{sheet}' already exists in pipeline[/]")
+                console.print(f"[warning]Sheet '{sheet}' already exists in pipeline[/]")
                 console.print(f"  Table: {sm.table_name}")
                 return
 
@@ -59,7 +59,7 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
         if file_pattern < len(config.file_patterns):
             target_fp = config.file_patterns[file_pattern]
         else:
-            console.print(f"[red]File pattern index {file_pattern} out of range[/]")
+            console.print(f"[error]File pattern index {file_pattern} out of range[/]")
             return
     else:
         # Find first xlsx pattern
@@ -69,27 +69,27 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
                 break
 
     if not target_fp:
-        console.print("[red]No Excel file pattern found in pipeline[/]")
+        console.print("[error]No Excel file pattern found in pipeline[/]")
         return
 
-    console.print(f"[dim]File pattern: {target_fp.filename_pattern}[/]")
+    console.print(f"[muted]File pattern: {target_fp.filename_pattern}[/]")
 
     # Discover latest file
-    console.print("\n[dim]Discovering files...[/]")
+    console.print("\n[muted]Discovering files...[/]")
     files = scrape_landing_page(config.landing_page)
 
     # Filter to matching files
     matching = [f for f in files if re.match(target_fp.filename_pattern, f.filename, re.IGNORECASE)]
 
     if not matching:
-        console.print(f"[red]No files matching pattern: {target_fp.filename_pattern}[/]")
+        console.print(f"[error]No files matching pattern: {target_fp.filename_pattern}[/]")
         return
 
     # Get latest (or specified period)
     if period:
         target_file = next((f for f in matching if f.period == period), None)
         if not target_file:
-            console.print(f"[red]No file found for period {period}[/]")
+            console.print(f"[error]No file found for period {period}[/]")
             return
     else:
         # Sort by period descending, take first
@@ -97,7 +97,7 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
         target_file = matching[0]
         period = target_file.period
 
-    console.print(f"[dim]Using file: {target_file.filename} (period: {period})[/]")
+    console.print(f"[muted]Using file: {target_file.filename} (period: {period})[/]")
 
     # Download file
     temp_dir = tempfile.mkdtemp()
@@ -107,32 +107,32 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
     # Check sheet exists
     sheets = get_sheet_names(local_path)
     if sheet not in sheets:
-        console.print(f"[red]Sheet '{sheet}' not found in file[/]")
-        console.print(f"[dim]Available sheets: {', '.join(sheets)}[/]")
+        console.print(f"[error]Sheet '{sheet}' not found in file[/]")
+        console.print(f"[muted]Available sheets: {', '.join(sheets)}[/]")
         return
 
-    console.print(f"[green]✓ Sheet found[/]")
+    console.print(f"[success]✓ Sheet found[/]")
 
     # Extract data
     try:
         extractor = FileExtractor(local_path, sheet)
         df = extractor.to_dataframe()
     except Exception as e:
-        console.print(f"[red]Error reading sheet: {e}[/]")
+        console.print(f"[error]Error reading sheet: {e}[/]")
         return
 
     if df.empty:
-        console.print("[yellow]Sheet is empty, skipping[/]")
+        console.print("[warning]Sheet is empty, skipping[/]")
         return
 
-    console.print(f"[dim]Rows: {len(df)}, Columns: {len(df.columns)}[/]")
+    console.print(f"[muted]Rows: {len(df)}, Columns: {len(df.columns)}[/]")
 
     # Detect grain
     grain_info = detect_grain(df)
     grain = grain_info['grain']
     grain_col = grain_info['grain_column']
     grain_desc = grain_info['description']
-    console.print(f"[dim]Grain: {grain} ({grain_desc})[/]")
+    console.print(f"[muted]Grain: {grain} ({grain_desc})[/]")
 
     # Generate table name and mappings
     table_name = make_table_name(pipeline, sheet)
@@ -143,7 +143,7 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
 
     # Enrich if requested
     if enrich:
-        console.print("[yellow]Enriching with LLM...[/]")
+        console.print("[warning]Enriching with LLM...[/]")
         enriched = enrich_sheet(
             sheet_name=sheet,
             columns=sanitized_cols,
@@ -157,22 +157,22 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
         table_desc = enriched['table_description']
         col_mappings = enriched['columns']
         col_descriptions = enriched['descriptions']
-        console.print(f"[green]LLM suggested: {table_name}[/]")
+        console.print(f"[success]LLM suggested: {table_name}[/]")
 
     # Load data
     from datawarp.loader import load_sheet as load_sheet_fn
 
-    console.print(f"\n[dim]Loading to {table_name}...[/]")
+    console.print(f"\n[muted]Loading to {table_name}...[/]")
     rows, learned_mappings, col_types = load_sheet_fn(
         local_path, sheet, table_name,
         period=period, column_mappings=col_mappings
     )
 
     if rows == 0:
-        console.print("[yellow]No rows loaded[/]")
+        console.print("[warning]No rows loaded[/]")
         return
 
-    console.print(f"[green]✓ Loaded {rows} rows[/]")
+    console.print(f"[success]✓ Loaded {rows} rows[/]")
 
     # Create SheetMapping
     new_mapping = SheetMapping(
@@ -196,6 +196,6 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
     # Save config
     save_config(config)
 
-    console.print(f"\n[green]✓ Sheet '{sheet}' added to pipeline[/]")
-    console.print(f"[dim]Table: {table_name}[/]")
-    console.print(f"[dim]Config saved[/]")
+    console.print(f"\n[success]✓ Sheet '{sheet}' added to pipeline[/]")
+    console.print(f"[muted]Table: {table_name}[/]")
+    console.print(f"[muted]Config saved[/]")
