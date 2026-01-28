@@ -3,7 +3,7 @@
 ## Overview
 
 DataWarp uses PostgreSQL with 2 schemas:
-- `datawarp` - Configuration and metadata (3 tables, 4 views)
+- `datawarp` - Configuration and metadata (4 tables, 4 views)
 - `staging` - Loaded NHS data (dynamic tables)
 
 ---
@@ -95,11 +95,50 @@ Logs LLM enrichment API calls for observability.
 | suggested_columns | JSONB | Column mapping suggestions |
 | success | BOOLEAN | Whether call succeeded |
 | error_message | TEXT | Error if failed |
+| original_column_count | INT | Original number of columns before compression |
+| compressed_column_count | INT | Number of columns after compression (NULL if not compressed) |
+| pattern_detected | VARCHAR(100) | Detected timeseries pattern (e.g., "col_{n}_{n+1}") |
 | created_at | TIMESTAMP | When call was made |
 
 **Indexes:**
 - `idx_enrichment_log_pipeline` on (pipeline_id)
 - `idx_enrichment_log_created` on (created_at DESC)
+
+---
+
+### Table: tbl_cli_runs
+
+Logs all CLI command executions (eventstore pattern).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | SERIAL PK | Auto-increment ID |
+| pipeline_id | VARCHAR(63) | Reference to pipeline (nullable) |
+| command | VARCHAR(50) | Command name (bootstrap, scan, backfill, list, history) |
+| args | JSONB | Command arguments |
+| started_at | TIMESTAMP | When command started |
+| ended_at | TIMESTAMP | When command completed |
+| duration_ms | INT | Total execution time |
+| status | VARCHAR(20) | running, success, failed, cancelled |
+| error_message | TEXT | Error details if failed |
+| result_summary | JSONB | Flexible summary (rows loaded, files processed, etc.) |
+| hostname | VARCHAR(255) | Machine that ran the command |
+| username | VARCHAR(100) | User who ran the command |
+
+**Indexes:**
+- `idx_cli_runs_pipeline` on (pipeline_id)
+- `idx_cli_runs_started` on (started_at DESC)
+- `idx_cli_runs_status` on (status)
+
+**Example result_summary:**
+```json
+{
+  "files_discovered": 3,
+  "sheets_processed": 8,
+  "rows_loaded": 12500,
+  "tables_created": ["tbl_icb_data", "tbl_trust_data"]
+}
+```
 
 ---
 
@@ -236,4 +275,20 @@ SELECT pipeline_id,
 FROM datawarp.tbl_enrichment_log
 WHERE success = true
 GROUP BY pipeline_id;
+```
+
+**Recent CLI runs:**
+```sql
+SELECT id, pipeline_id, command, status, duration_ms, started_at
+FROM datawarp.tbl_cli_runs
+ORDER BY started_at DESC
+LIMIT 10;
+```
+
+**Failed runs with errors:**
+```sql
+SELECT pipeline_id, command, error_message, started_at
+FROM datawarp.tbl_cli_runs
+WHERE status = 'failed'
+ORDER BY started_at DESC;
 ```

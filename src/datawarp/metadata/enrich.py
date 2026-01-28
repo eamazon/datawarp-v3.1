@@ -6,6 +6,9 @@ from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
+from .column_compressor import compress_columns, expand_columns
+from .canonicalize import remove_date_patterns
+
 load_dotenv()
 
 
@@ -65,13 +68,26 @@ def enrich_sheet(
 
     grain_context = f"\nData grain: {grain_hint} level data" if grain_hint else ""
 
+    # Compress timeseries columns to reduce tokens
+    original_column_count = len(columns)
+    compressed_columns, pattern_info = compress_columns(columns)
+    columns_for_prompt = compressed_columns
+
+    # Add pattern context to prompt if columns were compressed
+    pattern_note = ""
+    if pattern_info:
+        pattern_note = f"""
+
+NOTE: This sheet has {pattern_info['count']} timeseries columns following pattern "{pattern_info['pattern']}".
+Only {len(compressed_columns)} sample columns shown above. Apply the same semantic naming pattern to all timeseries columns."""
+
     prompt = f"""You are analyzing an NHS dataset. Suggest SHORT semantic names for this data.
 
 Sheet name: {sheet_name}
 Publication context: {publication_hint}{grain_context}
-Columns: {columns}
+Columns: {columns_for_prompt}
 Sample data (first 3 rows):
-{json.dumps(sample_rows[:3], indent=2, default=str)}
+{json.dumps(sample_rows[:3], indent=2, default=str)}{pattern_note}
 
 Respond with JSON only, no markdown code blocks:
 {{
@@ -107,6 +123,9 @@ Column rules:
         'provider': provider,
         'model': model,
         'prompt_text': prompt,
+        'original_column_count': original_column_count,
+        'compressed_column_count': len(compressed_columns) if pattern_info else None,
+        'pattern_detected': pattern_info['pattern'] if pattern_info else None,
     }
 
     try:
@@ -150,6 +169,14 @@ Column rules:
         # Ensure table_description exists
         if 'table_description' not in result:
             result['table_description'] = f"Data from {sheet_name}"
+
+        # Expand columns back to full set if compressed
+        if pattern_info:
+            result = expand_columns(result, pattern_info)
+
+        # Remove date patterns from table name for cross-period consistency
+        if 'table_name' in result:
+            result['table_name'] = remove_date_patterns(result['table_name'])
 
         # Log successful call
         log_data['success'] = True
@@ -198,9 +225,10 @@ def _log_enrichment_call(data: Dict) -> None:
                         input_tokens, output_tokens, total_tokens,
                         duration_ms,
                         suggested_table_name, suggested_columns,
-                        success, error_message
+                        success, error_message,
+                        original_column_count, compressed_column_count, pattern_detected
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                 """, (
                     data.get('pipeline_id'),
@@ -218,6 +246,9 @@ def _log_enrichment_call(data: Dict) -> None:
                     json.dumps(data.get('suggested_columns')) if data.get('suggested_columns') else None,
                     data.get('success', False),
                     data.get('error_message'),
+                    data.get('original_column_count'),
+                    data.get('compressed_column_count'),
+                    data.get('pattern_detected'),
                 ))
     except Exception as e:
         # Don't fail the enrichment if logging fails
