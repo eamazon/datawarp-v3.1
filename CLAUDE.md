@@ -119,6 +119,7 @@ PYTHONPATH=src python scripts/mcp_server.py --test
 3. **Fail fast and loud** - Log errors, re-raise exceptions
 4. **Discovery returns data, loading writes to DB** - Never mix
 5. **Test with real NHS URLs** - Assert row counts, not just "no errors"
+6. **All DB changes go in `sql/schema.sql`** - This is the single source of truth for database objects. Any new tables, columns, indexes, or views must be added here. Used by `scripts/reset_db.sh` to drop and recreate the entire datawalker database.
 
 ---
 
@@ -156,6 +157,11 @@ docs/
 
 ## Environment Setup
 
+**Always use the virtual environment:**
+```bash
+source .venv/bin/activate
+```
+
 ```bash
 # Required
 export POSTGRES_HOST=localhost
@@ -178,6 +184,7 @@ export LLM_MODEL=gemini-2.0-flash-exp
 - Adding "manager", "factory", "orchestrator" classes
 - Tests passing without asserting row counts
 - Swallowing exceptions silently
+- Database changes in code without updating `sql/schema.sql`
 
 ---
 
