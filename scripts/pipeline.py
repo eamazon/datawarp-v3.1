@@ -22,6 +22,7 @@ from datawarp.cli.scan import scan_command
 from datawarp.cli.backfill import backfill_command
 from datawarp.cli.list_history import list_command, history_command
 from datawarp.cli.enrich import enrich_command
+from datawarp.cli.add_sheet import add_sheet_command
 
 
 @click.group()
@@ -34,6 +35,7 @@ cli.add_command(bootstrap_command, name='bootstrap')
 cli.add_command(scan_command, name='scan')
 cli.add_command(backfill_command, name='backfill')
 cli.add_command(enrich_command, name='enrich')
+cli.add_command(add_sheet_command, name='add-sheet')
 cli.add_command(list_command, name='list')
 cli.add_command(history_command, name='history')
 
