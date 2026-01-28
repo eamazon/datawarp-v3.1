@@ -395,9 +395,7 @@ def load_dataframe(
             # =========================================================
             if period and 'period' in existing_cols:
                 cur.execute(f'DELETE FROM {full_table} WHERE period = %s', (period,))
-                deleted = cur.rowcount
-                if deleted > 0:
-                    console.print(f"[blue]Replacing {deleted} existing rows for period {period}[/]")
+                # Silently replace - caller controls output
 
             # Prepare data for COPY
             # Fix: Convert empty strings to NaN for numeric columns

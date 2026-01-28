@@ -21,17 +21,18 @@ from datawarp.tracking import track_run
 @click.option('--pipeline', required=True, help='Pipeline ID')
 @click.option('--from', 'from_period', help='Start period (YYYY-MM)')
 @click.option('--to', 'to_period', help='End period (YYYY-MM)')
-def backfill_command(pipeline: str, from_period: Optional[str], to_period: Optional[str]):
+@click.option('--force', is_flag=True, help='Reload even if already loaded')
+def backfill_command(pipeline: str, from_period: Optional[str], to_period: Optional[str], force: bool):
     """
     Backfill historical data for a pipeline.
 
     Loads all periods (or a range) that haven't been loaded yet.
     """
-    with track_run('backfill', {'pipeline': pipeline, 'from': from_period, 'to': to_period}, pipeline) as tracker:
-        _backfill_impl(pipeline, from_period, to_period, tracker)
+    with track_run('backfill', {'pipeline': pipeline, 'from': from_period, 'to': to_period, 'force': force}, pipeline) as tracker:
+        _backfill_impl(pipeline, from_period, to_period, force, tracker)
 
 
-def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optional[str], tracker: dict):
+def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optional[str], force: bool, tracker: dict):
     """Implementation of backfill command."""
     config = load_config(pipeline)
     if not config:
@@ -53,14 +54,16 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
     if to_period:
         available = [p for p in available if p <= to_period]
 
-    # Find unloaded periods
-    unloaded = config.get_new_periods(available)
-
-    if not unloaded:
-        console.print("[success]All periods already loaded![/]")
-        return
-
-    console.print(f"[warning]Will load {len(unloaded)} period(s)[/]")
+    # Find periods to load
+    if force:
+        to_load = available
+        console.print(f"[warning]Force reload: {len(to_load)} period(s)[/]")
+    else:
+        to_load = config.get_new_periods(available)
+        if not to_load:
+            console.print("[success]All periods already loaded![/]")
+            return
+        console.print(f"[warning]Will load {len(to_load)} period(s)[/]")
 
     if not Confirm.ask("Continue?", default=True):
         return
@@ -69,7 +72,7 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
     temp_dir = tempfile.mkdtemp()
     total_loaded = 0
 
-    for period in sorted(unloaded):
+    for period in sorted(to_load):
         console.print(f"\n[highlight]Loading period: {period}[/]")
 
         period_files = [item['file'] for item in by_period[period]]
@@ -82,8 +85,8 @@ def _backfill_impl(pipeline: str, from_period: Optional[str], to_period: Optiona
             save_config(config)
 
     # Update tracker
-    tracker['periods_loaded'] = list(unloaded)
-    tracker['periods_count'] = len(unloaded)
+    tracker['periods_loaded'] = list(to_load)
+    tracker['periods_count'] = len(to_load)
     tracker['total_rows'] = total_loaded
 
-    console.print(f"\n[success]Backfill complete - loaded {len(unloaded)} period(s)[/]")
+    console.print(f"\n[success]Backfill complete - loaded {len(to_load)} period(s)[/]")

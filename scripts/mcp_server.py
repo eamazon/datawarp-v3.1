@@ -246,7 +246,7 @@ def get_lineage(table_name: str) -> Dict:
             'publication': parent_config.name,
             'landing_page': parent_config.landing_page,
             'sheet_name': sheet_mapping.sheet_pattern,
-            'file_pattern': file_pattern_info.filename_pattern,
+            'file_patterns': file_pattern_info.filename_patterns,
         }
 
         total_cols = len(sheet_mapping.column_mappings)
@@ -270,7 +270,7 @@ def get_lineage(table_name: str) -> Dict:
             'publication': None,
             'landing_page': None,
             'sheet_name': None,
-            'file_pattern': None,
+            'file_patterns': None,
         }
         enrichment = {
             'version': None,
@@ -299,11 +299,15 @@ def get_lineage(table_name: str) -> Dict:
                     'loaded_at': row[4].isoformat() if row[4] else None,
                 })
 
+    # Include file_context if available (extracted from Notes/Contents sheets)
+    file_context = parent_config.file_context if parent_config else None
+
     return {
         'table_name': table_name,
         'source': source,
         'loads': loads,
         'enrichment': enrichment,
+        'file_context': file_context,  # KPI definitions, sheet descriptions, methodology
     }
 
 

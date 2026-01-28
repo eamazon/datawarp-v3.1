@@ -20,6 +20,7 @@ def enrich_sheet(
     grain_hint: str = "",
     pipeline_id: str = "",
     source_file: str = "",
+    file_context: Optional[Dict] = None,
 ) -> Dict:
     """
     Call LLM API to get semantic names and descriptions.
@@ -32,6 +33,7 @@ def enrich_sheet(
         sample_rows: First 3-5 rows as dicts
         publication_hint: e.g., "ADHD referrals", "MSA breaches"
         grain_hint: e.g., "icb", "trust" - from grain detection
+        file_context: Structured context from metadata sheets (sheets, kpis, methodology)
 
     Returns:
         {
@@ -48,7 +50,7 @@ def enrich_sheet(
         }
     """
     try:
-        from litellm import completion
+        from litellm import completion, completion_cost
     except ImportError:
         print("litellm not installed, using fallback")
         return _fallback_enrichment(sheet_name, columns)
@@ -68,6 +70,22 @@ def enrich_sheet(
 
     grain_context = f"\nData grain: {grain_hint} level data" if grain_hint else ""
 
+    # Build context section from file_context (extracted from metadata sheets)
+    context_section = ""
+    if file_context:
+        # Sheet description from Contents/TOC
+        sheet_desc = file_context.get('sheets', {}).get(sheet_name, '')
+        if sheet_desc:
+            context_section += f"\nSheet purpose (from file contents): {sheet_desc}"
+        # KPI definitions from Notes/Definitions
+        kpis = file_context.get('kpis', {})
+        if kpis:
+            context_section += f"\nKPI definitions from file: {json.dumps(kpis)}"
+        # Methodology notes
+        methodology = file_context.get('methodology', '')
+        if methodology:
+            context_section += f"\nMethodology: {methodology}"
+
     # Compress timeseries columns to reduce tokens
     original_column_count = len(columns)
     compressed_columns, pattern_info = compress_columns(columns)
@@ -82,7 +100,7 @@ NOTE: This sheet has {pattern_info['count']} timeseries columns following patter
 Only {len(compressed_columns)} sample columns shown above. Apply the same semantic naming pattern to all timeseries columns."""
 
     prompt = f"""You are analyzing an NHS dataset. Suggest SHORT semantic names for this data.
-
+{context_section}
 Sheet name: {sheet_name}
 Publication context: {publication_hint}{grain_context}
 Columns: {columns_for_prompt}
@@ -146,6 +164,14 @@ Column rules:
             log_data['input_tokens'] = getattr(usage, 'prompt_tokens', 0)
             log_data['output_tokens'] = getattr(usage, 'completion_tokens', 0)
             log_data['total_tokens'] = getattr(usage, 'total_tokens', 0)
+
+        # Calculate cost using LiteLLM's pricing database
+        try:
+            cost = completion_cost(completion_response=response)
+            log_data['cost_usd'] = cost
+        except Exception:
+            # Cost calculation may fail for some models not in pricing DB
+            log_data['cost_usd'] = None
 
         log_data['response_text'] = text
         log_data['duration_ms'] = duration_ms
@@ -222,13 +248,13 @@ def _log_enrichment_call(data: Dict) -> None:
                         pipeline_id, source_file, sheet_name,
                         provider, model,
                         prompt_text, response_text,
-                        input_tokens, output_tokens, total_tokens,
+                        input_tokens, output_tokens, total_tokens, cost_usd,
                         duration_ms,
                         suggested_table_name, suggested_columns,
                         success, error_message,
                         original_column_count, compressed_column_count, pattern_detected
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                 """, (
                     data.get('pipeline_id'),
@@ -241,6 +267,7 @@ def _log_enrichment_call(data: Dict) -> None:
                     data.get('input_tokens'),
                     data.get('output_tokens'),
                     data.get('total_tokens'),
+                    data.get('cost_usd'),
                     data.get('duration_ms'),
                     data.get('suggested_table_name'),
                     json.dumps(data.get('suggested_columns')) if data.get('suggested_columns') else None,

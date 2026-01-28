@@ -17,6 +17,7 @@ from urllib.parse import unquote
 
 from datawarp.cli.console import console
 from datawarp.cli.helpers import group_files_by_period, make_filename_pattern
+from datawarp.cli.schema_grouper import group_by_schema, pick_representative, extract_file_type
 from datawarp.cli.file_processor import process_data_file
 from datawarp.cli.sheet_selector import analyze_sheets, display_sheet_table, select_sheets
 from datawarp.discovery import scrape_landing_page, classify_url
@@ -136,7 +137,7 @@ def _select_period_and_files(by_period: dict) -> Tuple[str, List]:
     return latest, [period_files[i] for i in indices if 0 <= i < len(period_files)]
 
 
-def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: str, enrich: bool, filename: str) -> List[SheetMapping]:
+def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: str, enrich: bool, filename: str, file_context: dict = None) -> List[SheetMapping]:
     """Load selected sheets to database and return mappings."""
     mappings = []
     for sp in selected:
@@ -150,7 +151,8 @@ def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: st
             console.print("  [warning]Enriching with LLM...[/]")
             enriched = enrich_sheet(
                 sheet_name=sheet, columns=sanitized_cols, sample_rows=df.head(3).to_dict('records'),
-                publication_hint=auto_id, grain_hint=grain, pipeline_id=auto_id, source_file=local_path
+                publication_hint=auto_id, grain_hint=grain, pipeline_id=auto_id, source_file=local_path,
+                file_context=file_context,
             )
             table_name = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
             table_desc, col_mappings, col_descriptions = enriched['table_description'], enriched['columns'], enriched['descriptions']
@@ -177,20 +179,40 @@ def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: st
     return mappings
 
 
-def _process_excel(local_path: str, f, period: str, auto_id: str, enrich: bool, skip_unknown: bool) -> List[SheetMapping]:
-    """Process Excel file with sheet analysis and selection."""
+def _process_excel(local_path: str, f, period: str, auto_id: str, enrich: bool, skip_unknown: bool) -> tuple:
+    """Process Excel file with sheet analysis and selection.
+
+    Returns:
+        Tuple of (List[SheetMapping], Optional[dict]) - mappings and file_context
+    """
     sheets = get_sheet_names(local_path)
     console.print(f"\n  [bold]Analyzing {len(sheets)} sheets...[/]")
+
+    # Stage 0 + 1: Extract file context from metadata sheets (if enriching)
+    file_context = None
+    if enrich:
+        from datawarp.metadata.file_context import extract_metadata_text, extract_file_context
+        with console.status("Extracting metadata from Notes/Contents sheets..."):
+            metadata_text = extract_metadata_text(local_path)
+        if metadata_text:
+            console.print(f"  [muted]Found metadata ({len(metadata_text)} chars), extracting context...[/]")
+            ctx = extract_file_context(metadata_text, all_sheets=sheets, pipeline_id=auto_id, source_file=f.filename)
+            if ctx:
+                file_context = ctx.to_dict()
+                sheet_count = len(file_context.get('sheets', {}))
+                kpi_count = len(file_context.get('kpis', {}))
+                console.print(f"  [success]Extracted: {sheet_count} sheet descriptions, {kpi_count} KPI definitions[/]")
+
     previews = analyze_sheets(local_path, sheets)
     display_sheet_table(previews, f.filename)
     selected = select_sheets(previews, skip_unknown)
     if not selected:
         console.print("  [warning]No valid sheets selected[/]")
-        return []
-    return _load_sheets(selected, local_path, period, auto_id, enrich, f.filename)
+        return [], file_context
+    return _load_sheets(selected, local_path, period, auto_id, enrich, f.filename, file_context), file_context
 
 
-def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool) -> List[SheetMapping]:
+def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool, file_type: str = None) -> List[SheetMapping]:
     """Process CSV file and return sheet mappings."""
     try:
         preview = pd.read_csv(local_path, nrows=50)
@@ -203,11 +225,16 @@ def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool) ->
     console.print(f"  Grain: [bold white]{grain}[/] ({grain_desc})")
     sanitized_cols = [sanitize_name(str(c)) for c in preview.columns if not str(c).lower().startswith('unnamed')]
 
+    # Use file type if provided (from schema grouping), otherwise extract from filename
+    file_type = file_type or extract_file_type(f.filename)
+
     if enrich:
-        console.print("  [warning]Enriching with LLM...[/]")
+        console.print(f"  [warning]Enriching with LLM...[/] (type: {file_type})")
+        # Include file type in publication hint to distinguish data/measures/dq
+        pub_hint = f"{auto_id} ({file_type} file)" if file_type != "main" else auto_id
         enriched = enrich_sheet(
             sheet_name=os.path.splitext(f.filename)[0], columns=sanitized_cols, sample_rows=preview.head(3).to_dict('records'),
-            publication_hint=auto_id, grain_hint=grain, pipeline_id=auto_id, source_file=local_path
+            publication_hint=pub_hint, grain_hint=grain, pipeline_id=auto_id, source_file=local_path
         )
         table_name = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
         table_desc, col_mappings, col_descriptions = enriched['table_description'], enriched['columns'], enriched['descriptions']
@@ -227,12 +254,13 @@ def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool) ->
     )]
 
 
-def _save_pipeline(classification, auto_name: str, auto_id: str, file_patterns: List, loaded_periods: List[str], tracker: dict, is_update: bool = False, tables_before_load: set = None):
+def _save_pipeline(classification, auto_name: str, auto_id: str, file_patterns: List, loaded_periods: List[str], tracker: dict, is_update: bool = False, tables_before_load: set = None, file_context: dict = None):
     """Save pipeline configuration and update tracker."""
     config = PipelineConfig(
         pipeline_id=auto_id, name=auto_name, landing_page=classification.landing_page,
         file_patterns=file_patterns, loaded_periods=sorted(loaded_periods), auto_load=False,
         discovery_mode=classification.discovery_mode, url_pattern=classification.url_pattern, frequency=classification.frequency,
+        file_context=file_context,  # Store extracted metadata context for MCP
     )
     save_config(config)
 
@@ -297,13 +325,21 @@ def _bootstrap_impl(url: str, name: Optional[str], pipeline_id: Optional[str], e
         available_periods = sorted([p for p in by_period.keys() if p != 'unknown'], reverse=True)
         new_periods = existing.get_new_periods(available_periods)
 
+        # Get existing table names from config
+        existing_tables = []
+        for fp in existing.file_patterns:
+            for sm in fp.sheet_mappings:
+                if sm.table_name and sm.table_name not in existing_tables:
+                    existing_tables.append(sm.table_name)
+
         console.print(Panel(
             f"[bold]Pipeline already exists![/]\n\n"
             f"ID: {existing.pipeline_id}\n"
             f"Name: {existing.name}\n"
             f"Periods loaded: {len(existing.loaded_periods)}\n"
             f"Latest loaded: {max(existing.loaded_periods) if existing.loaded_periods else 'none'}\n"
-            f"New periods available: {len(new_periods)}",
+            f"New periods available: {len(new_periods)}\n"
+            f"Tables: {', '.join(existing_tables) if existing_tables else 'none'}",
             title="Existing Pipeline"
         ))
 
@@ -316,6 +352,20 @@ def _bootstrap_impl(url: str, name: Optional[str], pipeline_id: Optional[str], e
 
         if not Confirm.ask("\nRe-bootstrap anyway? (will replace existing config)", default=False):
             return
+
+        # Offer to clean up old tables to avoid duplicates
+        if existing_tables:
+            console.print(f"\n[warning]Existing tables:[/]")
+            for t in existing_tables:
+                console.print(f"  - staging.{t}")
+            if Confirm.ask("\nDrop existing tables before re-bootstrap? (recommended to avoid duplicates)", default=True):
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        for t in existing_tables:
+                            cur.execute(f"DROP TABLE IF EXISTS staging.{t}")
+                            console.print(f"  [muted]Dropped staging.{t}[/]")
+                console.print("[success]Old tables dropped[/]")
+
         console.print("")  # Blank line before continuing
 
     latest, selected_files = _select_period_and_files(by_period)
@@ -333,27 +383,66 @@ def _bootstrap_impl(url: str, name: Optional[str], pipeline_id: Optional[str], e
             cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'staging'")
             tables_before_load = {row[0] for row in cur.fetchall()}
 
-    loaded_periods = set()
+    # Download all files first
+    console.print(f"\n[info]Downloading {len(selected_files)} files...[/]")
+    downloads = []
     for f in selected_files:
-        # Use file's own period if available, otherwise fall back to latest
+        with console.status(f"Downloading {f.filename}..."):
+            downloads.append((f, download_file(f.url, temp_dir)))
+
+    # Separate CSVs (can group by schema) from others (process individually)
+    csvs = [(f, p) for f, p in downloads if f.file_type == 'csv']
+    others = [(f, p) for f, p in downloads if f.file_type != 'csv']
+
+    loaded_periods = set()
+
+    # Process CSVs grouped by schema (enrich once per group)
+    if csvs:
+        schema_groups = group_by_schema(csvs)
+        console.print(f"\n[info]Grouped {len(csvs)} CSVs into {len(schema_groups)} schema group(s)[/]")
+
+        for fingerprint, group in schema_groups.items():
+            rep_file, rep_path = pick_representative(group)
+            file_type = extract_file_type(rep_file.filename)
+            console.print(f"\n[highlight]Schema group ({len(group)} files, type: {file_type}): {unquote(rep_file.filename)}[/]")
+
+            # Enrich using representative
+            mappings = _process_csv(rep_path, rep_file, rep_file.period or latest, auto_id, enrich, file_type)
+            if not mappings:
+                continue
+            mapping = mappings[0]  # CSV produces single mapping
+
+            # Load all files in group with same mapping
+            for f, path in group:
+                file_period = f.period or latest
+                loaded_periods.add(file_period)
+                if (f, path) != (rep_file, rep_path):  # Rep already loaded
+                    console.print(f"  [muted]Loading {unquote(f.filename)} ({file_period})...[/]")
+                    rows, _, _ = load_file(path, mapping.table_name, period=file_period, column_mappings=mapping.column_mappings)
+                    record_load(auto_id, file_period, mapping.table_name, f.filename, None, rows)
+
+            file_patterns.append(FilePattern(filename_patterns=[make_filename_pattern(rep_file.filename)], file_types=['csv'], sheet_mappings=mappings))
+
+    # Process Excel/ZIP individually (have internal structure)
+    extracted_file_context = None  # Store file context from xlsx files
+    for f, local_path in others:
         file_period = f.period or latest
         loaded_periods.add(file_period)
-
         console.print(f"\n[highlight]Processing: {unquote(f.filename)}[/] (period: {file_period})")
-        with console.status("Downloading..."):
-            local_path = download_file(f.url, temp_dir)
 
         if f.file_type in ['xlsx', 'xls']:
-            mappings = _process_excel(local_path, f, file_period, auto_id, enrich, skip_unknown)
+            mappings, file_context = _process_excel(local_path, f, file_period, auto_id, enrich, skip_unknown)
+            if file_context and not extracted_file_context:
+                extracted_file_context = file_context  # Store first file's context
         elif f.file_type == 'zip':
             results = process_data_file(local_path, f.filename, 'zip', file_period, auto_id, enrich, console)
             mappings = [m for m, _ in results]
             for m, rows in results:
                 record_load(auto_id, file_period, m.table_name, f.filename, m.sheet_pattern or f.filename, rows)
         else:
-            mappings = _process_csv(local_path, f, file_period, auto_id, enrich)
+            mappings = []
 
         if mappings:
-            file_patterns.append(FilePattern(filename_pattern=make_filename_pattern(f.filename), file_types=[f.file_type], sheet_mappings=mappings))
+            file_patterns.append(FilePattern(filename_patterns=[make_filename_pattern(f.filename)], file_types=[f.file_type], sheet_mappings=mappings))
 
-    _save_pipeline(classification, auto_name, auto_id, file_patterns, list(loaded_periods), tracker, is_update, tables_before_load)
+    _save_pipeline(classification, auto_name, auto_id, file_patterns, list(loaded_periods), tracker, is_update, tables_before_load, extracted_file_context)

@@ -152,11 +152,33 @@ def load_period_files(
     config_modified = False
 
     for fp in config.file_patterns:
-        matching = [f for f in period_files if re.match(fp.filename_pattern, f.filename, re.IGNORECASE)]
+        # Match if ANY pattern matches
+        matching = [f for f in period_files
+                    if any(re.match(p, f.filename, re.IGNORECASE) for p in fp.filename_patterns)]
 
         if not matching:
-            console.print(f"  [warning]No file matching pattern: {fp.filename_pattern}[/]")
-            continue
+            # Try to find files with compatible schema
+            from datawarp.cli.schema_grouper import find_compatible_files
+            from datawarp.cli.helpers import make_filename_pattern
+            from rich.prompt import Confirm
+
+            compatible = find_compatible_files(fp, period_files, temp_dir)
+            if compatible:
+                sample_file = compatible[0][0]
+                new_pattern = make_filename_pattern(sample_file.filename)
+                console.print(f"  [warning]No match, but found {len(compatible)} file(s) with compatible schema:[/]")
+                console.print(f"    {sample_file.filename}")
+                if Confirm.ask(f"  Add pattern?", default=True):
+                    fp.filename_patterns.append(new_pattern)
+                    config_modified = True
+                    # Re-match with updated patterns (only match files fitting the new pattern)
+                    matching = [f for f in period_files
+                                if any(re.match(p, f.filename, re.IGNORECASE) for p in fp.filename_patterns)]
+                else:
+                    continue
+            else:
+                console.print(f"  [warning]No file matching patterns[/]")
+                continue
 
         for f in matching:
             console.print(f"  Processing: {unquote(f.filename)}")

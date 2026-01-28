@@ -72,13 +72,25 @@ def _scan_impl(pipeline: str, dry_run: bool, force_scrape: bool, tracker: dict):
     available = sorted([p for p in by_period.keys() if p != 'unknown'], reverse=True)
 
     # Find new periods
-    new_periods = config.get_new_periods(available)
+    new_periods = set(config.get_new_periods(available))
+
+    # Always reload the 2 most recent periods (handles provisional → final)
+    # NHS releases: current month provisional, previous month final
+    recent = sorted(available, reverse=True)[:2]
+    refreshed = [p for p in recent if p in config.loaded_periods]
+    new_periods.update(recent)
 
     if not new_periods:
         console.print("[success]No new periods found - up to date![/]")
         return
 
-    console.print(f"[warning]Found {len(new_periods)} new period(s):[/] {', '.join(sorted(new_periods))}")
+    new_only = sorted(new_periods - set(refreshed))
+    if new_only:
+        console.print(f"[info]New period(s):[/] {', '.join(new_only)}")
+    if refreshed:
+        console.print(f"[info]Refreshing:[/] {', '.join(refreshed)} (provisional → final)")
+
+    console.print(f"[warning]Total: {len(new_periods)} period(s) to load[/]")
 
     if dry_run:
         console.print("\n[muted]Dry run - no data loaded[/]")

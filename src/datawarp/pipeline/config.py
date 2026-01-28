@@ -43,22 +43,26 @@ class SheetMapping:
 
 @dataclass
 class FilePattern:
-    """Pattern for matching files in a pipeline"""
-    filename_pattern: str           # Regex: r"ADHD-.*\.xlsx"
+    """Pattern for matching files in a pipeline. Supports multiple patterns."""
+    filename_patterns: List[str] = field(default_factory=list)  # Multiple regex patterns
     file_types: List[str] = field(default_factory=lambda: ['xlsx'])
     sheet_mappings: List[SheetMapping] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
-            'filename_pattern': self.filename_pattern,
+            'filename_patterns': self.filename_patterns,
             'file_types': self.file_types,
             'sheet_mappings': [s.to_dict() for s in self.sheet_mappings],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> 'FilePattern':
+        # Backward compatibility: migrate old single pattern
+        patterns = data.get('filename_patterns', [])
+        if not patterns and 'filename_pattern' in data:
+            patterns = [data['filename_pattern']]
         return cls(
-            filename_pattern=data['filename_pattern'],
+            filename_patterns=patterns,
             file_types=data.get('file_types', ['xlsx']),
             sheet_mappings=[SheetMapping.from_dict(s) for s in data.get('sheet_mappings', [])],
         )
@@ -77,6 +81,8 @@ class PipelineConfig:
     discovery_mode: str = 'discover'  # template, discover, explicit
     url_pattern: Optional[str] = None  # For template mode: '{landing_page}/{month_name}-{year}'
     frequency: str = 'monthly'  # monthly, quarterly, annual
+    # File-level context from metadata sheets (Notes, Contents, Definitions)
+    file_context: Optional[Dict] = None  # Stored FileContext for MCP access
 
     def to_dict(self) -> dict:
         return {
@@ -89,6 +95,7 @@ class PipelineConfig:
             'discovery_mode': self.discovery_mode,
             'url_pattern': self.url_pattern,
             'frequency': self.frequency,
+            'file_context': self.file_context,
         }
 
     def to_json(self) -> str:
@@ -106,6 +113,7 @@ class PipelineConfig:
             discovery_mode=data.get('discovery_mode', 'discover'),
             url_pattern=data.get('url_pattern'),
             frequency=data.get('frequency', 'monthly'),
+            file_context=data.get('file_context'),
         )
 
     @classmethod

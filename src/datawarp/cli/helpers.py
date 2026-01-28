@@ -57,10 +57,13 @@ def make_filename_pattern(filename: str) -> str:
     pattern = re.sub(r'2\d{3}[-_]\d{2}', r'\\d{4}[-_]\\d{2}', pattern)
 
     # Abbreviated month + 2-digit year: nov25, aug25, may25
+    # Also match month + 4-digit year: nov2025
     short_months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
                     'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
     for month in short_months:
-        # Match month followed by 2 digits (e.g., nov25)
+        # Match month followed by 4 digits first (e.g., nov2025)
+        pattern = re.sub(f'{month}\\d{{4}}', r'[a-z]{3}\\d{4}', pattern, flags=re.IGNORECASE)
+        # Then 2 digits (e.g., nov25)
         pattern = re.sub(f'{month}\\d{{2}}', r'[a-z]{3}\\d{2}', pattern, flags=re.IGNORECASE)
 
     # Full month names
@@ -68,5 +71,11 @@ def make_filename_pattern(filename: str) -> str:
               'july', 'august', 'september', 'october', 'november', 'december']
     for month in months:
         pattern = re.sub(month, r'[a-z]+', pattern, flags=re.IGNORECASE)
+
+    # If source file has "provisional", make it optional in pattern
+    # This allows provisional pattern to match final files (for replacement)
+    # But final patterns should NOT match provisional files
+    if 'provisional' in pattern.lower():
+        pattern = re.sub(r'provisional', r'(provisional)?', pattern, flags=re.IGNORECASE)
 
     return pattern

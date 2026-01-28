@@ -16,6 +16,9 @@ This guide explains how DataWarp captures, enriches, and maintains metadata for 
 8. [Adding New Sheets](#8-adding-new-sheets)
 9. [Version Tracking](#9-version-tracking)
 10. [Quick Reference](#10-quick-reference)
+11. [Multi-Pattern Support & Auto-Detection](#11-multi-pattern-support--auto-detection)
+12. [Data Lineage & Provenance](#12-data-lineage--provenance)
+13. [MCP Server: Exposing Data to Claude](#13-mcp-server-exposing-data-to-claude)
 
 ---
 
@@ -609,6 +612,12 @@ python scripts/pipeline.py bootstrap --url "..." --id my_pipeline --enrich
 # Load new periods
 python scripts/pipeline.py scan --pipeline my_pipeline
 
+# Backfill historical periods
+python scripts/pipeline.py backfill --pipeline my_pipeline --from 2023-01 --to 2023-12
+
+# Force reload (even if already loaded)
+python scripts/pipeline.py backfill --pipeline my_pipeline --from 2023-04 --to 2023-04 --force
+
 # Fill empty descriptions
 python scripts/pipeline.py enrich --pipeline my_pipeline [--table X] [--dry-run]
 
@@ -651,6 +660,26 @@ WHERE column_description = '';
 -- Version history
 SELECT table_name, mappings_version, last_enriched
 FROM datawarp.v_table_metadata;
+
+-- Pattern → Table mapping
+SELECT
+    sm->>'table_name' as table_name,
+    jsonb_array_elements_text(fp->'filename_patterns') as pattern
+FROM datawarp.tbl_pipeline_configs c,
+     jsonb_array_elements(c.config->'file_patterns') as fp,
+     jsonb_array_elements(fp->'sheet_mappings') as sm
+WHERE c.pipeline_id = 'your_pipeline_id'
+ORDER BY table_name, pattern;
+
+-- File patterns with types
+SELECT
+    c.pipeline_id,
+    jsonb_array_elements_text(fp->'filename_patterns') as pattern,
+    fp->'file_types' as file_types,
+    jsonb_array_length(fp->'sheet_mappings') as sheet_count
+FROM datawarp.tbl_pipeline_configs c,
+     jsonb_array_elements(c.config->'file_patterns') as fp
+WHERE c.pipeline_id = 'your_pipeline_id';
 ```
 
 ### Metadata Flow Summary
@@ -674,6 +703,622 @@ Save config v1        Save config v(n+1)      Save config v(n+1)
     ▼                       ▼                       ▼
 Load data             Load data               (no data load)
 ```
+
+---
+
+## 11. Multi-Pattern Support & Auto-Detection
+
+NHS sometimes changes file naming conventions across years. DataWarp handles this with multi-pattern matching and auto-detection.
+
+### The Problem
+
+A pipeline bootstrapped with 2025 data may have a file pattern like:
+```
+msds-oct2025-exp-data\.csv
+```
+
+But 2023 files might be named differently:
+```
+msds-apr2023-exp-data-final.csv    (different suffix)
+msds-jan2022-experimental-data.csv  (different prefix)
+```
+
+The single pattern won't match historical files, breaking backfill.
+
+### Solution: Multiple Filename Patterns
+
+Each `FilePattern` now supports a list of patterns:
+
+```python
+@dataclass
+class FilePattern:
+    filename_patterns: List[str]  # Multiple patterns (was: filename_pattern: str)
+    file_types: List[str]
+    sheet_mappings: List[SheetMapping]
+```
+
+**Backward Compatibility**: Old configs with `filename_pattern` (singular) are auto-migrated to `filename_patterns` (list) when loaded.
+
+### Auto-Detection During Backfill
+
+When backfill finds no files matching existing patterns, it:
+1. Downloads unmatched files
+2. Compares schema fingerprint (column names)
+3. If 70%+ columns match, prompts to add new pattern
+
+**Example Output:**
+```
+Loading period: 2023-04
+
+  [warning] No match, but found 1 file(s) with compatible schema:
+    msds-apr2023-exp-data-final.csv
+  Add pattern? [Y/n]: y
+
+  Processing: msds-apr2023-exp-data-final.csv
+    tbl_national_maternity_stats: 2304 rows
+```
+
+### Backfill Command
+
+```bash
+# Load historical periods
+python scripts/pipeline.py backfill \
+  --pipeline maternity_services_monthly_statistics \
+  --from 2023-04 \
+  --to 2023-12
+
+# Force reload even if already loaded
+python scripts/pipeline.py backfill \
+  --pipeline maternity_services_monthly_statistics \
+  --from 2023-04 \
+  --to 2023-12 \
+  --force
+```
+
+### Check Pattern → Table Mapping
+
+```sql
+-- See which patterns map to which tables
+SELECT
+    sm->>'table_name' as table_name,
+    jsonb_array_elements_text(fp->'filename_patterns') as pattern
+FROM datawarp.tbl_pipeline_configs c,
+     jsonb_array_elements(c.config->'file_patterns') as fp,
+     jsonb_array_elements(fp->'sheet_mappings') as sm
+WHERE c.pipeline_id = 'your_pipeline_id'
+ORDER BY table_name, pattern;
+```
+
+**Example output:**
+```
+            table_name             |                  pattern
+-----------------------------------+-------------------------------------------
+ tbl_national_maternity_stats      | msds-[a-z]{3}\d{4}-exp-data\.csv
+ tbl_national_maternity_stats      | msds-[a-z]{3}\d{4}-exp-data-final\.csv
+ tbl_national_maternity_measures   | msds-[a-z]{3}\d{4}-exp-measures\.csv
+```
+
+### Detailed Pattern View
+
+```sql
+-- Full pattern details with file types
+SELECT
+    c.pipeline_id,
+    jsonb_array_elements_text(fp->'filename_patterns') as pattern,
+    fp->'file_types' as file_types,
+    jsonb_array_length(fp->'sheet_mappings') as sheet_count
+FROM datawarp.tbl_pipeline_configs c,
+     jsonb_array_elements(c.config->'file_patterns') as fp
+WHERE c.pipeline_id = 'your_pipeline_id';
+```
+
+### Provisional → Final Data Handling
+
+NHS often releases provisional data, then updates with final figures. The `scan` command automatically refreshes the most recent 2 periods:
+
+```
+Scanning: Maternity Services Monthly Statistics
+
+  Will load: 2025-01 (new)
+  Will refresh: 2024-12, 2024-11 (recent periods)
+
+Loading period: 2024-12
+  Replacing 2304 rows
+  Processing: msds-dec2024-exp-data.csv
+    tbl_national_maternity_stats: 2310 rows (final figures)
+```
+
+---
+
+## 12. Data Lineage & Provenance
+
+Understanding where data came from is critical for debugging, auditing, and trust. DataWarp tracks complete lineage from source URL to database table.
+
+### Lineage Data Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           DATA LINEAGE FLOW                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  NHS Landing Page                    Pipeline Config                  Database
+  ───────────────                    ───────────────                  ────────
+        │                                  │                              │
+        ▼                                  ▼                              ▼
+┌───────────────────┐            ┌─────────────────────┐        ┌──────────────────┐
+│ digital.nhs.uk/   │            │ tbl_pipeline_configs│        │ staging.tbl_*    │
+│ .../mi-adhd       │───────────▶│                     │        │                  │
+│                   │            │ • pipeline_id       │        │ • actual data    │
+│ Source of truth   │            │ • landing_page      │        │ • _period column │
+│ for file URLs     │            │ • file_patterns[]   │        │ • _loaded_at     │
+└───────────────────┘            │ • sheet_mappings[]  │        └──────────────────┘
+        │                        │ • column_mappings   │                 ▲
+        │                        └─────────────────────┘                 │
+        │                                  │                              │
+        ▼                                  ▼                              │
+┌───────────────────┐            ┌─────────────────────┐                 │
+│ Source Files      │            │ tbl_load_history    │                 │
+│                   │            │                     │─────────────────┘
+│ adhd_may25.csv    │───────────▶│ • table_name        │
+│ adhd_aug25.csv    │            │ • source_file       │
+│ data_dict.xlsx    │            │ • sheet_name        │
+│                   │            │ • period            │
+│ Downloaded &      │            │ • rows_loaded       │
+│ processed         │            │ • loaded_at         │
+└───────────────────┘            └─────────────────────┘
+```
+
+### Query: Full Lineage for a Table
+
+Trace a table back to its source files, landing page, and load history:
+
+```sql
+-- Get lineage for a specific table
+SELECT
+    h.table_name,
+    h.pipeline_id,
+    c.config->>'name' as publication,
+    c.config->>'landing_page' as landing_page,
+    h.period,
+    h.source_file,
+    h.sheet_name,
+    h.rows_loaded,
+    h.loaded_at
+FROM datawarp.tbl_load_history h
+LEFT JOIN datawarp.tbl_pipeline_configs c ON h.pipeline_id = c.pipeline_id
+WHERE h.table_name = 'tbl_adhd_counts'
+ORDER BY h.loaded_at DESC;
+```
+
+**Example output:**
+```
+   table_name    | pipeline_id |  publication  |         landing_page          | period  |   source_file    | sheet_name | rows_loaded |       loaded_at
+-----------------+-------------+---------------+-------------------------------+---------+------------------+------------+-------------+------------------------
+ tbl_adhd_counts | mi_adhd     | ADHD          | https://digital.nhs.uk/.../   | 2025-11 | adhd_nov25.csv   |            |        8149 | 2025-01-28 14:30:00
+ tbl_adhd_counts | mi_adhd     | ADHD          | https://digital.nhs.uk/.../   | 2025-08 | adhd_aug25.csv   |            |        1318 | 2025-01-28 10:15:00
+ tbl_adhd_counts | mi_adhd     | ADHD          | https://digital.nhs.uk/.../   | 2025-05 | adhd_may25.csv   |            |        1304 | 2025-01-27 09:00:00
+```
+
+### Query: Enrichment Metadata for a Table
+
+Get the semantic enrichment details (column mappings, descriptions, grain):
+
+```sql
+-- Get enrichment info from config
+SELECT
+    pc.pipeline_id,
+    pc.config->>'name' as publication,
+    pc.config->>'landing_page' as landing_page,
+    m->>'table_name' as table_name,
+    m->>'table_description' as description,
+    m->>'grain' as grain,
+    COALESCE((m->>'mappings_version')::int, 1) as version,
+    m->>'last_enriched' as last_enriched,
+    jsonb_object_keys(m->'column_mappings') as columns
+FROM datawarp.tbl_pipeline_configs pc,
+     jsonb_array_elements(pc.config->'file_patterns') fp,
+     jsonb_array_elements(fp->'sheet_mappings') m
+WHERE m->>'table_name' = 'tbl_adhd_counts';
+```
+
+**Example output:**
+```
+ pipeline_id | publication |      landing_page       |   table_name    |        description         | grain | version | last_enriched |   columns
+-------------+-------------+-------------------------+-----------------+----------------------------+-------+---------+---------------+-------------
+ mi_adhd     | ADHD        | https://digital.nhs.uk/ | tbl_adhd_counts | ADHD referrals by category | icb   |       3 | 2025-01-28    | indicator
+ mi_adhd     | ADHD        | https://digital.nhs.uk/ | tbl_adhd_counts | ADHD referrals by category | icb   |       3 | 2025-01-28    | period_start
+ mi_adhd     | ADHD        | https://digital.nhs.uk/ | tbl_adhd_counts | ADHD referrals by category | icb   |       3 | 2025-01-28    | period_end
+ mi_adhd     | ADHD        | https://digital.nhs.uk/ | tbl_adhd_counts | ADHD referrals by category | icb   |       3 | 2025-01-28    | count
+```
+
+### Quick Lineage Using Views
+
+For common queries, use the pre-built views:
+
+```sql
+-- Table-level metadata (one row per table)
+SELECT * FROM datawarp.v_table_metadata
+WHERE table_name = 'tbl_adhd_counts';
+
+-- Column-level metadata (one row per column)
+SELECT * FROM datawarp.v_column_metadata
+WHERE table_name = 'tbl_adhd_counts';
+
+-- Combined metadata + load stats
+SELECT * FROM datawarp.v_tables
+WHERE table_name = 'tbl_adhd_counts';
+```
+
+### Lineage Diagram: Single Table
+
+```
+                              tbl_adhd_counts
+                             ┌───────────────┐
+                             │               │
+                             │  8,771 rows   │
+                             │  3 periods    │
+                             │               │
+                             └───────┬───────┘
+                                     │
+           ┌─────────────────────────┼─────────────────────────┐
+           │                         │                         │
+           ▼                         ▼                         ▼
+    ┌─────────────┐          ┌─────────────┐          ┌─────────────┐
+    │ 2025-05     │          │ 2025-08     │          │ 2025-11     │
+    │ 1,304 rows  │          │ 1,318 rows  │          │ 8,149 rows  │
+    │             │          │             │          │             │
+    └──────┬──────┘          └──────┬──────┘          └──────┬──────┘
+           │                        │                        │
+           ▼                        ▼                        ▼
+    adhd_may25.csv           adhd_aug25.csv           adhd_nov25.csv
+           │                        │                        │
+           └────────────────────────┼────────────────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │  NHS Digital Landing Page     │
+                    │  digital.nhs.uk/.../mi-adhd   │
+                    └───────────────────────────────┘
+```
+
+### Answering Lineage Questions
+
+| Question | Query |
+|----------|-------|
+| Where did this table come from? | `v_table_metadata` → `landing_page` |
+| What file was loaded for period X? | `tbl_load_history` → `source_file` |
+| When was this data last refreshed? | `tbl_load_history` → `MAX(loaded_at)` |
+| How many rows per period? | `tbl_load_history` → `rows_loaded` |
+| What columns were enriched? | `v_column_metadata` → `is_enriched = true` |
+| What's the data grain? | `v_table_metadata` → `grain` |
+
+---
+
+## 13. MCP Server: Exposing Data to Claude
+
+The Model Context Protocol (MCP) lets Claude access DataWarp's NHS data through a standardized interface. This section explains the architecture, available tools, and how to configure Claude Desktop.
+
+### What is MCP?
+
+MCP is a protocol that allows AI assistants like Claude to:
+- Discover available datasets
+- Understand column meanings (via enriched metadata)
+- Execute SQL queries
+- Trace data lineage
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MCP ARCHITECTURE                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+   User                     Claude Desktop              DataWarp MCP Server
+   ────                     ──────────────              ───────────────────
+     │                            │                              │
+     │  "What ADHD data          │                              │
+     │   do you have?"           │                              │
+     │ ─────────────────────────▶│                              │
+     │                            │   list_datasets()            │
+     │                            │ ────────────────────────────▶│
+     │                            │                              │
+     │                            │   [{name: tbl_adhd_counts,   │
+     │                            │     description: "ADHD...",  │
+     │                            │     grain: "icb", ...}]      │
+     │                            │◀────────────────────────────│
+     │                            │                              │
+     │  "Here are 3 tables       │                              │
+     │   with ADHD data..."      │                              │
+     │◀─────────────────────────│                              │
+     │                            │                              │
+     │  "Show me referrals       │                              │
+     │   by ICB for Nov 2025"    │                              │
+     │ ─────────────────────────▶│                              │
+     │                            │   get_schema('tbl_adhd...')  │
+     │                            │ ────────────────────────────▶│
+     │                            │                              │
+     │                            │   {columns: [...],           │
+     │                            │    descriptions: {...}}      │
+     │                            │◀────────────────────────────│
+     │                            │                              │
+     │                            │   query("SELECT icb_code...") │
+     │                            │ ────────────────────────────▶│
+     │                            │                              │
+     │                            │   {rows: [...]}              │
+     │                            │◀────────────────────────────│
+     │                            │                              │
+     │  [formatted table         │                              │
+     │   with results]           │                              │
+     │◀─────────────────────────│                              │
+```
+
+### MCP Tools
+
+DataWarp exposes 5 tools through MCP:
+
+| Tool | Purpose | Example Use |
+|------|---------|-------------|
+| `list_datasets` | Discover available tables | "What data do you have?" |
+| `get_schema` | Get column names & descriptions | "What columns are in this table?" |
+| `query` | Execute SQL (SELECT only) | "Show me top 10 ICBs by referrals" |
+| `get_periods` | List available time periods | "What months of data exist?" |
+| `get_lineage` | Trace data provenance | "Where did this data come from?" |
+
+### Tool Details
+
+#### 1. list_datasets
+
+Returns all tables with enriched metadata.
+
+**Response includes:**
+```json
+{
+  "name": "tbl_adhd_counts",
+  "description": "ADHD referrals by category",
+  "grain": "icb",
+  "grain_description": "Integrated Care Board level data",
+  "row_count": 8149,
+  "periods": ["2025-05", "2025-08", "2025-11"],
+  "pipeline_id": "mi_adhd",
+  "publication_name": "ADHD",
+  "landing_page": "https://digital.nhs.uk/.../mi-adhd",
+  "has_enriched_columns": true,
+  "mappings_version": 3
+}
+```
+
+#### 2. get_schema
+
+Returns column-level metadata including original names, semantic names, and descriptions.
+
+**Response includes:**
+```json
+{
+  "table_name": "tbl_adhd_counts",
+  "description": "ADHD referrals by category",
+  "grain": "icb",
+  "columns": [
+    {
+      "name": "icb_code",
+      "original_name": "org_code",
+      "type": "TEXT",
+      "description": "Integrated Care Board organisation code",
+      "is_enriched": true
+    }
+  ]
+}
+```
+
+#### 3. query
+
+Execute SQL queries (SELECT only, auto-limited to 1000 rows).
+
+**Safety features:**
+- Only SELECT statements allowed
+- Auto-adds LIMIT if not present
+- Returns structured results
+
+#### 4. get_periods
+
+Returns available time periods for a table.
+
+```json
+["2025-05", "2025-08", "2025-11"]
+```
+
+#### 5. get_lineage
+
+Returns complete provenance: source, load history, enrichment status.
+
+```json
+{
+  "table_name": "tbl_adhd_counts",
+  "source": {
+    "pipeline_id": "mi_adhd",
+    "publication": "ADHD",
+    "landing_page": "https://digital.nhs.uk/...",
+    "sheet_name": null,
+    "file_pattern": "adhd_[a-z]{3}\\d{2}\\.csv"
+  },
+  "loads": [
+    {"period": "2025-11", "file": "adhd_nov25.csv", "rows": 8149, "loaded_at": "..."},
+    {"period": "2025-08", "file": "adhd_aug25.csv", "rows": 1318, "loaded_at": "..."}
+  ],
+  "enrichment": {
+    "version": 3,
+    "last_enriched": "2025-01-28",
+    "columns_total": 15,
+    "columns_enriched": 12,
+    "columns_pending": 3
+  }
+}
+```
+
+### Data Flow: Config → MCP
+
+All metadata comes from the JSONB config (single source of truth):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SINGLE SOURCE OF TRUTH                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                      tbl_pipeline_configs.config (JSONB)
+                     ┌─────────────────────────────────────┐
+                     │                                     │
+                     │  file_patterns: [{                  │
+                     │    filename_patterns: [...],        │
+                     │    sheet_mappings: [{               │
+                     │      table_name,        ─────────────────▶ list_datasets
+                     │      table_description, ─────────────────▶ get_schema
+                     │      column_mappings,   ─────────────────▶ get_schema
+                     │      column_descriptions,────────────────▶ get_schema
+                     │      grain,             ─────────────────▶ list_datasets
+                     │      mappings_version   ─────────────────▶ get_lineage
+                     │    }]                               │
+                     │  }]                                 │
+                     │                                     │
+                     └─────────────────────────────────────┘
+                                      │
+                                      │ No separate metadata tables
+                                      │ No drift possible
+                                      ▼
+                     ┌─────────────────────────────────────┐
+                     │         MCP Server reads            │
+                     │         directly from config        │
+                     └─────────────────────────────────────┘
+```
+
+### Configuring Claude Desktop
+
+To connect Claude Desktop to DataWarp's MCP server:
+
+#### Step 1: Locate Config File
+
+```bash
+# macOS
+~/Library/Application Support/Claude/claude_desktop_config.json
+
+# Windows
+%APPDATA%\Claude\claude_desktop_config.json
+
+# Linux
+~/.config/Claude/claude_desktop_config.json
+```
+
+#### Step 2: Add MCP Server Configuration
+
+Edit `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "datawarp-nhs": {
+      "command": "python",
+      "args": [
+        "/path/to/datawarp-v3.1/scripts/mcp_server.py"
+      ],
+      "env": {
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_DB": "datawalker",
+        "POSTGRES_USER": "databot",
+        "POSTGRES_PASSWORD": "databot",
+        "PYTHONPATH": "/path/to/datawarp-v3.1/src"
+      }
+    }
+  }
+}
+```
+
+#### Step 3: Restart Claude Desktop
+
+Close and reopen Claude Desktop. You should see "datawarp-nhs" in the MCP tools menu.
+
+### Testing MCP Server
+
+Before configuring Claude Desktop, test the server locally:
+
+```bash
+# Test mode - shows what MCP would return
+PYTHONPATH=src python scripts/mcp_server.py --test
+```
+
+**Expected output:**
+```
+DataWarp MCP Server - Test Mode
+
+1. list_datasets()
+┌────────────────────┬─────────────────────────────┬───────┬──────────┬─────────┐
+│ Table              │ Description                 │ Rows  │ Enriched │ Version │
+├────────────────────┼─────────────────────────────┼───────┼──────────┼─────────┤
+│ tbl_adhd_counts    │ ADHD referrals by category  │ 8149  │ Yes      │ 3       │
+│ tbl_national_adhd  │ National ADHD metrics       │ 126   │ Yes      │ 1       │
+└────────────────────┴─────────────────────────────┴───────┴──────────┴─────────┘
+
+2. get_schema('tbl_adhd_counts')
+  Pipeline: mi_adhd
+  Version: 3
+  Last enriched: 2025-01-28
+  Column mappings: 15 total, 12 enriched
+
+3. get_lineage('tbl_adhd_counts')
+  Pipeline: mi_adhd
+  Publication: ADHD
+  Enrichment: v3, 12/15 enriched, 3 pending
+┌─────────┬──────────────────┬───────┬─────────────────────┐
+│ Period  │ File             │ Rows  │ Loaded At           │
+├─────────┼──────────────────┼───────┼─────────────────────┤
+│ 2025-11 │ adhd_nov25.csv   │ 8149  │ 2025-01-28 14:30:00 │
+│ 2025-08 │ adhd_aug25.csv   │ 1318  │ 2025-01-28 10:15:00 │
+└─────────┴──────────────────┴───────┴─────────────────────┘
+
+MCP server is ready!
+```
+
+### Example Claude Conversation
+
+Once configured, Claude can query your data:
+
+**User:** "What NHS data do you have?"
+
+**Claude:** (calls `list_datasets`)
+> I have access to 3 NHS datasets:
+> 1. **tbl_adhd_counts** - ADHD referrals by category (ICB level, 8,149 rows)
+> 2. **tbl_national_adhd_metrics** - National ADHD metrics definitions (126 rows)
+> 3. **tbl_adhd_indicators** - Historical ADHD indicator data (1,304 rows)
+
+**User:** "Show me the top 5 ICBs by ADHD referrals in November 2025"
+
+**Claude:** (calls `get_schema`, then `query`)
+```sql
+SELECT icb_name, SUM(referrals_received) as total_referrals
+FROM staging.tbl_adhd_counts
+WHERE period = '2025-11'
+GROUP BY icb_name
+ORDER BY total_referrals DESC
+LIMIT 5
+```
+
+> | ICB | Total Referrals |
+> |-----|-----------------|
+> | NHS Greater Manchester | 4,521 |
+> | NHS West Yorkshire | 3,892 |
+> | ... | ... |
+
+**User:** "Where does this data come from?"
+
+**Claude:** (calls `get_lineage`)
+> This data comes from the **ADHD** publication on NHS Digital:
+> - Landing page: https://digital.nhs.uk/.../mi-adhd
+> - Latest file: adhd_nov25.csv (loaded 2025-01-28)
+> - Enrichment: version 3, 12 of 15 columns have semantic names
+
+### Troubleshooting MCP
+
+| Problem | Solution |
+|---------|----------|
+| Claude doesn't see MCP tools | Restart Claude Desktop, check config path |
+| "Connection refused" | Ensure PostgreSQL is running |
+| Empty descriptions | Run `enrich --pipeline X` to fill descriptions |
+| Stale data | Run `scan --pipeline X` to load new periods |
 
 ---
 

@@ -72,17 +72,18 @@ def add_sheet_command(pipeline: str, sheet: str, file_pattern: Optional[int], en
         console.print("[error]No Excel file pattern found in pipeline[/]")
         return
 
-    console.print(f"[muted]File pattern: {target_fp.filename_pattern}[/]")
+    console.print(f"[muted]File patterns: {target_fp.filename_patterns}[/]")
 
     # Discover latest file
     console.print("\n[muted]Discovering files...[/]")
     files = scrape_landing_page(config.landing_page)
 
-    # Filter to matching files
-    matching = [f for f in files if re.match(target_fp.filename_pattern, f.filename, re.IGNORECASE)]
+    # Filter to matching files (match ANY pattern)
+    matching = [f for f in files
+                if any(re.match(p, f.filename, re.IGNORECASE) for p in target_fp.filename_patterns)]
 
     if not matching:
-        console.print(f"[error]No files matching pattern: {target_fp.filename_pattern}[/]")
+        console.print(f"[error]No files matching patterns: {target_fp.filename_patterns}[/]")
         return
 
     # Get latest (or specified period)
