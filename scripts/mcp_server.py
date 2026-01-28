@@ -33,16 +33,19 @@ def list_datasets(schema: str = 'staging') -> List[Dict]:
         - grain: entity level (icb, trust, national)
         - row_count: number of rows
         - periods: list of available periods
+        - pipeline_id, publication_name, landing_page: source info
+        - has_enriched_columns: whether any columns have semantic names
+        - mappings_version: config version number
     """
     results = []
 
-    # Build mapping from saved configs
+    # Build mapping from saved configs (table_name -> (config, SheetMapping))
     configs = list_configs()
-    config_map = {}  # table_name -> SheetMapping
+    config_map = {}
     for cfg in configs:
         for fp in cfg.file_patterns:
             for sm in fp.sheet_mappings:
-                config_map[sm.table_name] = sm
+                config_map[sm.table_name] = (cfg, sm)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -73,23 +76,43 @@ def list_datasets(schema: str = 'staging') -> List[Dict]:
 
                 # Get description from config or infer
                 if table in config_map:
-                    sm = config_map[table]
+                    cfg, sm = config_map[table]
                     desc = sm.table_description or _infer_table_description(table)
                     grain = sm.grain
                     grain_desc = sm.grain_description
+                    # Check if any columns have been enriched (semantic != original)
+                    has_enriched = any(k != v for k, v in sm.column_mappings.items())
+                    result = {
+                        'name': table,
+                        'description': desc,
+                        'grain': grain,
+                        'grain_description': grain_desc,
+                        'row_count': row_count,
+                        'periods': periods,
+                        # NEW: Publication context
+                        'pipeline_id': cfg.pipeline_id,
+                        'publication_name': cfg.name,
+                        'landing_page': cfg.landing_page,
+                        # NEW: Enrichment metadata
+                        'has_enriched_columns': has_enriched,
+                        'mappings_version': sm.mappings_version,
+                    }
                 else:
-                    desc = _infer_table_description(table)
-                    grain = 'unknown'
-                    grain_desc = ''
+                    result = {
+                        'name': table,
+                        'description': _infer_table_description(table),
+                        'grain': 'unknown',
+                        'grain_description': '',
+                        'row_count': row_count,
+                        'periods': periods,
+                        'pipeline_id': None,
+                        'publication_name': None,
+                        'landing_page': None,
+                        'has_enriched_columns': False,
+                        'mappings_version': None,
+                    }
 
-                results.append({
-                    'name': table,
-                    'description': desc,
-                    'grain': grain,
-                    'grain_description': grain_desc,
-                    'row_count': row_count,
-                    'periods': periods,
-                })
+                results.append(result)
 
     return results
 
@@ -101,36 +124,78 @@ def get_schema(table_name: str, schema: str = 'staging') -> Dict:
     Uses saved column descriptions from LLM enrichment if available.
 
     Returns:
-        - table_name
-        - description
-        - grain
-        - columns: list of {name, type, description, sample_values}
+        - table_name, description, grain, grain_description
+        - pipeline_id, publication_name, landing_page (source info)
+        - column_mappings: dict of original_name -> semantic_name
+        - mappings_version, last_enriched (version tracking)
+        - columns: list of {name, type, description, sample_values, original_name, is_enriched}
         - row_count
     """
     # Find config for this table
     configs = list_configs()
     sheet_mapping = None
+    parent_config = None
     for cfg in configs:
         for fp in cfg.file_patterns:
             for sm in fp.sheet_mappings:
                 if sm.table_name == table_name:
                     sheet_mapping = sm
+                    parent_config = cfg
                     break
 
     # Get base metadata
     metadata = get_table_metadata(table_name, schema)
 
-    # Enhance with config descriptions
+    # Build reverse mapping: semantic_name -> original_name
+    reverse_mappings = {}
     if sheet_mapping:
+        reverse_mappings = {v: k for k, v in sheet_mapping.column_mappings.items()}
+
+    # Enhance with config descriptions
+    if sheet_mapping and parent_config:
         metadata['description'] = sheet_mapping.table_description or metadata.get('description', '')
         metadata['grain'] = sheet_mapping.grain
         metadata['grain_description'] = sheet_mapping.grain_description
 
-        # Add enriched column descriptions
+        # NEW: Publication context
+        metadata['pipeline_id'] = parent_config.pipeline_id
+        metadata['publication_name'] = parent_config.name
+        metadata['landing_page'] = parent_config.landing_page
+
+        # NEW: Column mappings (original -> semantic)
+        metadata['column_mappings'] = sheet_mapping.column_mappings
+
+        # NEW: Version tracking
+        metadata['mappings_version'] = sheet_mapping.mappings_version
+        metadata['last_enriched'] = sheet_mapping.last_enriched
+
+        # Enhance each column with enrichment metadata
         for col in metadata.get('columns', []):
             col_name = col['name']
+
+            # Find original name (reverse lookup from semantic -> original)
+            original_name = reverse_mappings.get(col_name, col_name)
+            col['original_name'] = original_name
+            col['is_enriched'] = original_name != col_name
+
+            # Get description - try semantic name first, then original
             if col_name in sheet_mapping.column_descriptions:
                 col['description'] = sheet_mapping.column_descriptions[col_name]
+            elif original_name in sheet_mapping.column_descriptions:
+                col['description'] = sheet_mapping.column_descriptions[original_name]
+    else:
+        # No config - add empty enrichment metadata
+        metadata['pipeline_id'] = None
+        metadata['publication_name'] = None
+        metadata['landing_page'] = None
+        metadata['column_mappings'] = {}
+        metadata['mappings_version'] = None
+        metadata['last_enriched'] = None
+
+        # Mark all columns as not enriched
+        for col in metadata.get('columns', []):
+            col['original_name'] = col['name']
+            col['is_enriched'] = False
 
     return metadata
 
@@ -249,7 +314,7 @@ def handle_mcp_request(request: Dict) -> Dict:
             'tools': [
                 {
                     'name': 'list_datasets',
-                    'description': 'List all available NHS datasets with descriptions and row counts',
+                    'description': 'List all NHS datasets with descriptions, grain, publication source, and enrichment status',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -259,7 +324,7 @@ def handle_mcp_request(request: Dict) -> Dict:
                 },
                 {
                     'name': 'get_schema',
-                    'description': 'Get detailed column information for a dataset',
+                    'description': 'Get column metadata including original/semantic name mappings, descriptions, and whether columns were LLM-enriched',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -337,11 +402,13 @@ def test_mode():
         table.add_column("Table")
         table.add_column("Description")
         table.add_column("Rows", justify="right")
-        table.add_column("Periods")
+        table.add_column("Enriched")
+        table.add_column("Version")
 
         for d in datasets:
-            periods_str = f"{len(d['periods'])} periods" if d['periods'] else '-'
-            table.add_row(d['name'], d['description'], str(d['row_count']), periods_str)
+            enriched = "[green]Yes[/]" if d.get('has_enriched_columns') else "[dim]No[/]"
+            version = str(d.get('mappings_version', '-'))
+            table.add_row(d['name'], d['description'][:40], str(d['row_count']), enriched, version)
 
         console.print(table)
 
@@ -351,20 +418,32 @@ def test_mode():
         console.print(f"\n[bold]2. get_schema('{first_table}')[/]")
 
         schema_info = get_schema(first_table)
+
+        # Show metadata summary
+        console.print(f"  [dim]Pipeline: {schema_info.get('pipeline_id', 'N/A')}[/]")
+        console.print(f"  [dim]Version: {schema_info.get('mappings_version', 'N/A')}[/]")
+        console.print(f"  [dim]Last enriched: {schema_info.get('last_enriched', 'Never')}[/]")
+
+        # Show column_mappings if present
+        mappings = schema_info.get('column_mappings', {})
+        if mappings:
+            enriched_count = sum(1 for k, v in mappings.items() if k != v)
+            console.print(f"  [dim]Column mappings: {len(mappings)} total, {enriched_count} enriched[/]")
+
         table = Table()
         table.add_column("Column")
-        table.add_column("Type")
+        table.add_column("Original")
+        table.add_column("Enriched")
         table.add_column("Description")
-        table.add_column("Sample")
 
         for col in schema_info['columns'][:10]:
-            sample = str(col['sample_values'][0]) if col['sample_values'] else '-'
-            if len(sample) > 30:
-                sample = sample[:30] + '...'
-            table.add_row(col['name'], col['type'], col['description'], sample)
+            original = col.get('original_name', col['name'])
+            is_enriched = "[green]Yes[/]" if col.get('is_enriched') else "[dim]No[/]"
+            desc = (col.get('description', '') or '')[:35]
+            table.add_row(col['name'], original, is_enriched, desc)
 
         if len(schema_info['columns']) > 10:
-            table.add_row('...', '', f"({len(schema_info['columns']) - 10} more)", '')
+            table.add_row('...', '', '', f"({len(schema_info['columns']) - 10} more)")
 
         console.print(table)
 
