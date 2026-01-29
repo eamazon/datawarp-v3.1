@@ -19,6 +19,7 @@ This guide explains how DataWarp captures, enriches, and maintains metadata for 
 11. [Multi-Pattern Support & Auto-Detection](#11-multi-pattern-support--auto-detection)
 12. [Data Lineage & Provenance](#12-data-lineage--provenance)
 13. [MCP Server: Exposing Data to Claude](#13-mcp-server-exposing-data-to-claude)
+14. [CLI Commands Reference](#14-cli-commands-reference)
 
 ---
 
@@ -1319,6 +1320,429 @@ LIMIT 5
 | "Connection refused" | Ensure PostgreSQL is running |
 | Empty descriptions | Run `enrich --pipeline X` to fill descriptions |
 | Stale data | Run `scan --pipeline X` to load new periods |
+
+---
+
+## 14. CLI Commands Reference
+
+Complete reference for all DataWarp CLI commands with detailed examples and nuances.
+
+### Command Overview
+
+| Command | Purpose | LLM Calls? | Modifies Config? |
+|---------|---------|------------|------------------|
+| `bootstrap` | Initial setup from NHS URL | Yes (if `--enrich`) | Creates new |
+| `scan` | Load newly published periods | No | Updates `loaded_periods` |
+| `backfill` | Load historical periods | No | Updates `loaded_periods` |
+| `reset` | Clear data, keep enrichment | No | Clears `loaded_periods` |
+| `enrich` | Fill empty column descriptions | Yes | Updates mappings |
+| `add-sheet` | Add new sheet to pipeline | Yes (if `--enrich`) | Adds sheet mapping |
+| `list` | Show all pipelines | No | No |
+| `history` | Show load history | No | No |
+
+---
+
+### bootstrap
+
+**Purpose:** Create a new pipeline from an NHS URL. Discovers files, optionally enriches with LLM, loads data, saves config.
+
+```bash
+python scripts/pipeline.py bootstrap --url <URL> --id <ID> [--enrich] [--name <NAME>]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--url` | NHS landing page URL (required) |
+| `--id` | Pipeline ID (auto-generated from URL if omitted) |
+| `--name` | Human-readable name (auto-generated if omitted) |
+| `--enrich` | Call LLM for semantic column names (recommended) |
+| `--skip-unknown` | Skip sheets with no detected entity (default: true) |
+
+**What it does:**
+1. Classifies URL (discovery mode, frequency)
+2. Scrapes landing page for files
+3. Groups files by period
+4. Prompts user to select period and files
+5. For each file: detects grain, enriches (if `--enrich`), loads to staging
+6. Saves pipeline config as JSONB
+
+**Re-bootstrapping existing pipelines:**
+```
+╭───────── Existing Pipeline ─────────╮
+│ Pipeline already exists!            │
+│ Tables: tbl_icb_sessions            │
+╰─────────────────────────────────────╯
+
+Re-bootstrap anyway? [y/N]: y
+
+Drop existing tables before re-bootstrap? [Y/n]: y
+  Dropped staging.tbl_icb_sessions
+```
+
+**Nuances:**
+- Re-bootstrap offers to drop old tables to avoid duplicates (LLM may generate different names)
+- Two-stage enrichment: extracts context from Notes/Contents sheets first, uses it for better naming
+- Config stores `file_context` for MCP access to KPI definitions
+
+---
+
+### scan
+
+**Purpose:** Find and load newly published periods using saved patterns. No LLM calls - uses saved column mappings.
+
+```bash
+python scripts/pipeline.py scan --pipeline <ID> [--dry-run] [--force-scrape]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--pipeline` | Pipeline ID (required) |
+| `--dry-run` | Show what would be loaded, don't load |
+| `--force-scrape` | Force landing page scrape even in template mode |
+
+**How scan determines what to load:**
+
+```python
+# 1. Get periods available on website
+available = [2024-01, 2024-02, 2024-03, 2024-04, 2024-05, 2024-06]
+
+# 2. Compare against config.loaded_periods
+loaded = [2024-01, 2024-02, 2024-03]
+new_periods = available - loaded  # [2024-04, 2024-05, 2024-06]
+
+# 3. Also refresh 2 most recent (provisional → final)
+recent = [2024-06, 2024-05]
+to_load = new_periods + recent  # [2024-04, 2024-05, 2024-06]
+```
+
+**Example output:**
+```
+Scanning: ADHD
+Discovery mode: template
+
+  o august-2025: 3 files
+  o november-2025: 5 files
+
+New period(s): 2025-08, 2025-11
+Refreshing: 2025-05 (provisional → final)
+
+Loading period: 2025-08
+  Processing: adhd_aug25.csv
+    tbl_adhd_counts: 1318 rows
+```
+
+**After reset:** When `loaded_periods = []`, scan loads ALL available periods:
+```bash
+# Reset clears loaded_periods
+python scripts/pipeline.py reset --pipeline mi_adhd
+
+# Scan now sees everything as "new"
+python scripts/pipeline.py scan --pipeline mi_adhd
+# Loads: 2024-01, 2024-02, 2024-03, 2024-04, 2024-05, 2024-06 (all)
+```
+
+**Nuances:**
+- Always refreshes 2 most recent periods (NHS publishes provisional, then final)
+- Uses saved `column_mappings` from config - no LLM calls
+- Detects column drift and adds identity mappings for new columns
+- Updates `config.loaded_periods` after successful load
+
+---
+
+### backfill
+
+**Purpose:** Load historical periods. Useful for loading data older than what's on the landing page.
+
+```bash
+python scripts/pipeline.py backfill --pipeline <ID> --from <YYYY-MM> --to <YYYY-MM> [--force]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--pipeline` | Pipeline ID (required) |
+| `--from` | Start period (required, format: YYYY-MM) |
+| `--to` | End period (required, format: YYYY-MM) |
+| `--force` | Load even if period already in `loaded_periods` |
+
+**Use cases:**
+```bash
+# Load specific historical range
+python scripts/pipeline.py backfill --pipeline mi_adhd --from 2023-01 --to 2023-12
+
+# Force reload a period (e.g., data was corrupted)
+python scripts/pipeline.py backfill --pipeline mi_adhd --from 2024-06 --to 2024-06 --force
+
+# After reset, load specific periods (not all)
+python scripts/pipeline.py reset --pipeline mi_adhd --yes
+python scripts/pipeline.py backfill --pipeline mi_adhd --from 2024-01 --to 2024-03
+```
+
+**Auto-pattern detection:**
+
+When backfill finds files that don't match existing patterns:
+```
+Loading period: 2023-04
+
+  [warning] No match, but found 1 file(s) with compatible schema:
+    msds-apr2023-exp-data-final.csv
+  Add pattern? [Y/n]: y
+
+  Processing: msds-apr2023-exp-data-final.csv
+    tbl_national_maternity_stats: 2304 rows
+```
+
+**Nuances:**
+- Skips periods already in `loaded_periods` unless `--force`
+- Generates period URLs from template pattern
+- Auto-detects schema-compatible files with different naming
+- Adds new filename patterns to config when discovered
+
+---
+
+### reset
+
+**Purpose:** Clear loaded data while preserving expensive LLM-generated enrichment (table names, column mappings, descriptions).
+
+```bash
+python scripts/pipeline.py reset --pipeline <ID> [--yes]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--pipeline` | Pipeline ID (required) |
+| `--yes`, `-y` | Skip confirmation prompt |
+
+**What reset does:**
+1. Drops staging tables for the pipeline
+2. Clears `tbl_load_history` for the pipeline
+3. Sets `config.loaded_periods = []`
+
+**What reset preserves:**
+- `table_name` (LLM-generated)
+- `table_description` (LLM-generated)
+- `column_mappings` (LLM-generated)
+- `column_descriptions` (LLM-generated)
+- `file_patterns`, `sheet_mappings`
+- `file_context` (extracted KPIs, methodology)
+
+**Example output:**
+```
+╭─────────── Reset Pipeline Data ───────────╮
+│ Pipeline: iucadc_new_from_april_2021      │
+│ Name: IUCADC New From April 2021          │
+│ Periods loaded: 3                         │
+│ Tables: 2                                 │
+╰───────────────────────────────────────────╯
+
+      Tables to clear
+┌─────────────────────────┬───────────┐
+│ Table                   │ Status    │
+├─────────────────────────┼───────────┤
+│ staging.tbl_icb_sessions│ 4521 rows │
+│ staging.tbl_icb_triage  │ 1203 rows │
+└─────────────────────────┴───────────┘
+
+This will:
+  1. Drop staging tables listed above
+  2. Clear load history for this pipeline
+  3. Reset loaded_periods to empty
+
+Preserved: table names, column mappings, descriptions (enrichment)
+
+Proceed with reset? [y/N]: y
+  Dropped staging.tbl_icb_sessions
+  Dropped staging.tbl_icb_triage
+  Cleared load history
+  Reset loaded_periods
+
+Reset complete!
+
+To reload data: python scripts/pipeline.py scan --pipeline iucadc_new_from_april_2021
+```
+
+**Typical workflow:**
+```bash
+# 1. Reset (clears data, keeps enrichment)
+python scripts/pipeline.py reset --pipeline mi_adhd --yes
+
+# 2. Reload all periods (uses saved mappings, no LLM cost)
+python scripts/pipeline.py scan --pipeline mi_adhd
+
+# Or reload specific periods
+python scripts/pipeline.py backfill --pipeline mi_adhd --from 2024-01 --to 2024-06
+```
+
+**When to use reset:**
+- Data corruption and need to reload from source
+- Testing changes to loader code
+- Schema changed and need fresh tables
+- Disk space cleanup (can reload later)
+
+---
+
+### enrich
+
+**Purpose:** Fill empty column descriptions using LLM. Run after drift detection adds new columns.
+
+```bash
+python scripts/pipeline.py enrich --pipeline <ID> [--table <NAME>] [--dry-run] [--force]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--pipeline` | Pipeline ID (required) |
+| `--table` | Specific table to enrich (optional) |
+| `--dry-run` | Show what would be enriched, don't call LLM |
+| `--force` | Re-enrich all columns, even those with descriptions |
+
+**Example:**
+```bash
+# Check what needs enrichment
+python scripts/pipeline.py enrich --pipeline mi_adhd --dry-run
+
+# Enrich empty descriptions
+python scripts/pipeline.py enrich --pipeline mi_adhd
+
+# Force re-enrich everything (regenerate all descriptions)
+python scripts/pipeline.py enrich --pipeline mi_adhd --force
+```
+
+**Nuances:**
+- Only enriches columns where `description = ''`
+- Bumps `mappings_version` after enrichment
+- Logs LLM calls to `tbl_enrichment_log`
+
+---
+
+### add-sheet
+
+**Purpose:** Add a new sheet from an existing file to the pipeline.
+
+```bash
+python scripts/pipeline.py add-sheet --pipeline <ID> --sheet <NAME> [--no-enrich]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--pipeline` | Pipeline ID (required) |
+| `--sheet` | Sheet name to add (required) |
+| `--no-enrich` | Skip LLM enrichment |
+
+---
+
+### list
+
+**Purpose:** Show all registered pipelines.
+
+```bash
+python scripts/pipeline.py list
+```
+
+**Output:**
+```
+╭─────────────────────────── Registered Pipelines ───────────────────────────╮
+│                                                                             │
+│  mi_adhd                                                                    │
+│    Name: ADHD                                                               │
+│    URL: https://digital.nhs.uk/.../mi-adhd                                  │
+│    Periods: 3 loaded                                                        │
+│    Tables: tbl_adhd_counts, tbl_national_adhd_metrics                       │
+│                                                                             │
+│  maternity_services                                                         │
+│    Name: Maternity Services Monthly Statistics                              │
+│    URL: https://digital.nhs.uk/.../maternity-services                       │
+│    Periods: 12 loaded                                                       │
+│    Tables: tbl_national_maternity_stats                                     │
+│                                                                             │
+╰─────────────────────────────────────────────────────────────────────────────╯
+```
+
+---
+
+### history
+
+**Purpose:** Show load history for a pipeline.
+
+```bash
+python scripts/pipeline.py history --pipeline <ID>
+```
+
+**Output:**
+```
+╭────────────────────── Load History: mi_adhd ──────────────────────╮
+│                                                                    │
+│  Period   │ Table              │ Rows  │ File           │ Loaded  │
+│  ─────────┼────────────────────┼───────┼────────────────┼──────── │
+│  2025-11  │ tbl_adhd_counts    │ 8149  │ adhd_nov25.csv │ Jan 28  │
+│  2025-08  │ tbl_adhd_counts    │ 1318  │ adhd_aug25.csv │ Jan 28  │
+│  2025-05  │ tbl_adhd_counts    │ 1304  │ adhd_may25.csv │ Jan 27  │
+│                                                                    │
+╰────────────────────────────────────────────────────────────────────╯
+```
+
+---
+
+### Command Workflow Diagram
+
+```
+                                    ┌─────────────┐
+                                    │   START     │
+                                    └──────┬──────┘
+                                           │
+                                           ▼
+                              ┌────────────────────────┐
+                              │  bootstrap --enrich    │
+                              │  (creates pipeline,    │
+                              │   LLM enrichment)      │
+                              └────────────┬───────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────────┐
+                    │                                          │
+                    ▼                                          ▼
+          ┌─────────────────┐                        ┌─────────────────┐
+          │  scan           │                        │  backfill       │
+          │  (new periods)  │                        │  (historical)   │
+          └────────┬────────┘                        └────────┬────────┘
+                   │                                          │
+                   │     ┌────────────────────┐               │
+                   │     │  Column drift?     │               │
+                   └────▶│  New columns added │◀──────────────┘
+                         └─────────┬──────────┘
+                                   │ yes
+                                   ▼
+                         ┌─────────────────┐
+                         │  enrich         │
+                         │  (fill empty    │
+                         │   descriptions) │
+                         └─────────────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────┐
+                    │  Need to reload data?    │
+                    │  (corruption, testing)   │
+                    └────────────┬─────────────┘
+                                 │ yes
+                                 ▼
+                    ┌──────────────────────────┐
+                    │  reset                   │
+                    │  (clears data, keeps     │
+                    │   enrichment)            │
+                    └────────────┬─────────────┘
+                                 │
+                                 ▼
+                    ┌──────────────────────────┐
+                    │  scan or backfill        │
+                    │  (reload with saved      │
+                    │   mappings, no LLM cost) │
+                    └──────────────────────────┘
+```
 
 ---
 

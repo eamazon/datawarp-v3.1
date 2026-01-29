@@ -6,6 +6,7 @@ Commands:
     bootstrap   Learn pattern from NHS URL and load latest period
     scan        Find and load new periods for a pipeline
     backfill    Load all historical periods
+    reset       Clear data but keep enrichment (for reload without LLM cost)
     list        List registered pipelines
     history     Show load history for a pipeline
 """
@@ -23,6 +24,7 @@ from datawarp.cli.backfill import backfill_command
 from datawarp.cli.list_history import list_command, history_command
 from datawarp.cli.enrich import enrich_command
 from datawarp.cli.add_sheet import add_sheet_command
+from datawarp.cli.reset import reset_command
 
 
 @click.group()
@@ -36,6 +38,7 @@ cli.add_command(scan_command, name='scan')
 cli.add_command(backfill_command, name='backfill')
 cli.add_command(enrich_command, name='enrich')
 cli.add_command(add_sheet_command, name='add-sheet')
+cli.add_command(reset_command, name='reset')
 cli.add_command(list_command, name='list')
 cli.add_command(history_command, name='history')
 
