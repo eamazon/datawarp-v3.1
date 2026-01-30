@@ -34,8 +34,11 @@
 - `bootstrap --url <URL>` - Discover, enrich, load, save pattern
 - `scan --pipeline <ID>` - Load new periods automatically
 - `backfill --pipeline <ID>` - Load historical periods
+- `reset --pipeline <ID>` - Clear data, keep enrichment mappings
 - `list` - Show pipelines
 - `history --pipeline <ID>` - Show load history
+
+**Full CLI reference:** `docs/mcp/DATAWARP_GUIDE.md` (Section 14)
 
 ---
 
@@ -54,19 +57,27 @@ copy = f'COPY ({", ".join(df.columns)}) FROM STDIN'
 
 ---
 
-## Database Schema (3 Tables)
+## Database Schema (4 Tables, 5 Views)
 
 ```sql
 -- datawarp schema (config)
 tbl_pipeline_configs    -- pipeline_id, config (JSONB), timestamps
-tbl_load_history        -- pipeline_id, period, table_name, rows_loaded
+tbl_load_history        -- pipeline_id, period, table_name, rows_loaded, source_rows, source_path
 tbl_enrichment_log      -- LLM call logging (tokens, cost, timing)
+tbl_cli_runs            -- CLI command tracking (timing, status)
+
+-- Views
+v_table_metadata        -- Table names, descriptions, grain from config
+v_column_metadata       -- Column mappings and descriptions
+v_table_stats           -- Row counts, periods loaded per table
+v_tables                -- Combined metadata + stats
+v_load_reconciliation   -- Source rows vs loaded rows (data integrity check)
 
 -- staging schema (data)
-staging.<table_name>    -- Dynamic tables with _period, _loaded_at columns
+staging.<table_name>    -- Dynamic tables with period column
 ```
 
-**Full spec:** `docs/DATABASE_SPEC.md`
+**Source of truth:** `sql/schema.sql`
 
 ---
 
@@ -77,10 +88,13 @@ staging.<table_name>    -- Dynamic tables with _period, _loaded_at columns
 | JSONB config storage | Entire PipelineConfig in one column, no 39-table schema |
 | DataFrame is truth | DDL and COPY both use df.columns - prevents drift |
 | Grain detection before enrichment | Skip useless sheets (notes, methodology) |
-| Append-only loading | `_period` column tracks data across periods |
+| Append-only loading | `period` column tracks data across periods |
 | Enrichment returns dict | Single application point, no scattered logic |
+| Table name collision prevention | `_TableNameRegistry` ensures unique names per session |
+| Source row reconciliation | `v_load_reconciliation` compares source vs loaded rows |
+| CSV/XLSX deduplication | ZIP files deduplicated, XLSX preferred over CSV |
 
-**Full spec:** `docs/ARCHITECTURE.md`
+**Full guide:** `docs/mcp/DATAWARP_GUIDE.md`
 
 ---
 
@@ -98,6 +112,12 @@ PYTHONPATH=src python scripts/pipeline.py bootstrap \
 ```bash
 psql -d datawalker -c "SELECT table_name FROM information_schema.tables WHERE table_schema='staging'"
 psql -d datawalker -c "SELECT * FROM datawarp.tbl_load_history ORDER BY loaded_at DESC LIMIT 10"
+```
+
+### Verify Data Integrity (no data loss)
+```bash
+psql -d datawalker -c "SELECT table_name, source_rows, rows_loaded, reconciliation_status FROM datawarp.v_load_reconciliation WHERE reconciliation_status != 'match'"
+# Expected: 0 rows
 ```
 
 ### Test MCP
@@ -146,12 +166,14 @@ PYTHONPATH=src python scripts/mcp_server.py --test
 
 ```
 docs/
-├── ARCHITECTURE.md      # System design, data flow, components
-├── DATABASE_SPEC.md     # Schema, tables, columns, indexes
-├── USER_GUIDE.md        # CLI usage, examples, troubleshooting
-└── tasks/
-    └── CURRENT.md       # Active work tracking
+├── mcp/
+│   └── DATAWARP_GUIDE.md   # Complete guide (CLI, schema, SQL, architecture)
+├── tasks/
+│   └── CURRENT.md          # Active work tracking
+└── archive/                # Historical design docs (reference only)
 ```
+
+**Main reference:** `docs/mcp/DATAWARP_GUIDE.md` - covers CLI commands, database schema, SQL verification queries, and architecture.
 
 ---
 
