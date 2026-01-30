@@ -6,7 +6,7 @@ then saves the pattern for future scans.
 """
 import os
 import tempfile
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import click
 import pandas as pd
@@ -27,6 +27,40 @@ from datawarp.pipeline import PipelineConfig, FilePattern, SheetMapping, save_co
 from datawarp.tracking import track_run
 from datawarp.storage import get_connection
 from datawarp.utils import sanitize_name, make_table_name
+
+
+class _TableNameRegistry:
+    """Track table names within a bootstrap session to prevent collisions."""
+
+    def __init__(self):
+        self._used: Dict[str, str] = {}  # name → source
+
+    def register(self, name: str, source: str) -> str:
+        """Register name, return unique version if collision."""
+        if name not in self._used:
+            self._used[name] = source
+            return name
+
+        # Collision - generate suffix from source
+        suffix = self._extract_suffix(source)
+        unique = f"{name}_{suffix}"
+
+        # Ensure truly unique
+        counter = 1
+        while unique in self._used:
+            unique = f"{name}_{suffix}_{counter}"
+            counter += 1
+
+        self._used[unique] = source
+        return unique
+
+    def _extract_suffix(self, source: str) -> str:
+        """Extract meaningful suffix from source path."""
+        lower = source.lower()
+        for keyword in ['historical', 'site', 'trust', 'national', 'diagnosis', 'elective', 'non_elective']:
+            if keyword in lower:
+                return keyword
+        return 'alt'
 
 
 @click.command('bootstrap')
@@ -137,12 +171,16 @@ def _select_period_and_files(by_period: dict) -> Tuple[str, List]:
     return latest, [period_files[i] for i in indices if 0 <= i < len(period_files)]
 
 
-def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: str, enrich: bool, filename: str, file_context: dict = None) -> List[SheetMapping]:
+def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: str, enrich: bool, filename: str, file_context: dict = None, name_registry: _TableNameRegistry = None) -> List[SheetMapping]:
     """Load selected sheets to database and return mappings."""
     mappings = []
     for sp in selected:
         sheet, df, grain_info = sp['name'], sp['df'], sp['grain_info']
         grain, grain_col, grain_desc = grain_info['grain'], grain_info['grain_column'], grain_info['description']
+
+        # Track source metrics for reconciliation
+        source_rows = len(df)
+        source_columns = len(df.columns)
 
         console.print(f"\n  [bold]Loading: {sheet}[/] ({sp['rows']} rows, {grain})")
         sanitized_cols = [sanitize_name(str(c)) for c in df.columns if not str(c).lower().startswith('unnamed')]
@@ -154,12 +192,17 @@ def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: st
                 publication_hint=auto_id, grain_hint=grain, pipeline_id=auto_id, source_file=local_path,
                 file_context=file_context,
             )
-            table_name = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
+            suggested = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
             table_desc, col_mappings, col_descriptions = enriched['table_description'], enriched['columns'], enriched['descriptions']
-            console.print(f"  [success]LLM suggested: {table_name}[/]")
+            console.print(f"  [success]LLM suggested: {suggested}[/]")
         else:
-            table_name = make_table_name(auto_id, sanitize_name(sheet))
+            suggested = make_table_name(auto_id, sanitize_name(sheet))
             table_desc, col_mappings, col_descriptions = f"Data from {sheet}", {c: c for c in sanitized_cols}, {}
+
+        # Resolve collisions if registry provided
+        table_name = name_registry.register(suggested, f"{filename}/{sheet}") if name_registry else suggested
+        if table_name != suggested:
+            console.print(f"  [warning]Name collision resolved: → {table_name}[/]")
 
         console.print(f"  [muted]Table: staging.{table_name}[/]")
         with console.status("Loading to database..."):
@@ -170,7 +213,8 @@ def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: st
             continue
 
         console.print(f"  [success]Loaded {rows} rows[/]")
-        record_load(auto_id, period, table_name, filename, sheet, rows)
+        record_load(auto_id, period, table_name, filename, sheet, rows,
+                    source_rows=source_rows, source_columns=source_columns, source_path=f"{filename}/{sheet}")
         mappings.append(SheetMapping(
             sheet_pattern=sheet, table_name=table_name, table_description=table_desc,
             column_mappings=learned_mappings, column_descriptions=col_descriptions,
@@ -179,7 +223,7 @@ def _load_sheets(selected: List[dict], local_path: str, period: str, auto_id: st
     return mappings
 
 
-def _process_excel(local_path: str, f, period: str, auto_id: str, enrich: bool, skip_unknown: bool) -> tuple:
+def _process_excel(local_path: str, f, period: str, auto_id: str, enrich: bool, skip_unknown: bool, name_registry: _TableNameRegistry = None) -> tuple:
     """Process Excel file with sheet analysis and selection.
 
     Returns:
@@ -209,13 +253,17 @@ def _process_excel(local_path: str, f, period: str, auto_id: str, enrich: bool, 
     if not selected:
         console.print("  [warning]No valid sheets selected[/]")
         return [], file_context
-    return _load_sheets(selected, local_path, period, auto_id, enrich, f.filename, file_context), file_context
+    return _load_sheets(selected, local_path, period, auto_id, enrich, f.filename, file_context, name_registry), file_context
 
 
-def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool, file_type: str = None) -> List[SheetMapping]:
+def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool, file_type: str = None, name_registry: _TableNameRegistry = None) -> List[SheetMapping]:
     """Process CSV file and return sheet mappings."""
     try:
-        preview = pd.read_csv(local_path, nrows=50)
+        # Read full file for source metrics
+        full_df = pd.read_csv(local_path, low_memory=False)
+        preview = full_df.head(50)
+        source_rows = len(full_df)
+        source_columns = len(full_df.columns)
     except Exception as e:
         console.print(f"  [error]Error reading CSV: {e}[/]")
         return []
@@ -236,18 +284,24 @@ def _process_csv(local_path: str, f, period: str, auto_id: str, enrich: bool, fi
             sheet_name=os.path.splitext(f.filename)[0], columns=sanitized_cols, sample_rows=preview.head(3).to_dict('records'),
             publication_hint=pub_hint, grain_hint=grain, pipeline_id=auto_id, source_file=local_path
         )
-        table_name = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
+        suggested = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
         table_desc, col_mappings, col_descriptions = enriched['table_description'], enriched['columns'], enriched['descriptions']
-        console.print(f"  [success]LLM suggested: {table_name}[/]")
+        console.print(f"  [success]LLM suggested: {suggested}[/]")
     else:
-        table_name = make_table_name(auto_id, sanitize_name(os.path.splitext(f.filename)[0]))
+        suggested = make_table_name(auto_id, sanitize_name(os.path.splitext(f.filename)[0]))
         table_desc, col_mappings, col_descriptions = f"Data from {unquote(f.filename)}", {c: c for c in sanitized_cols}, {}
+
+    # Resolve collisions if registry provided
+    table_name = name_registry.register(suggested, f.filename) if name_registry else suggested
+    if table_name != suggested:
+        console.print(f"  [warning]Name collision resolved: → {table_name}[/]")
 
     with console.status("Loading to database..."):
         rows, learned_mappings, col_types = load_file(local_path, table_name, period=period, column_mappings=col_mappings)
 
     console.print(f"  [success]Loaded {rows} rows to staging.{table_name}[/]")
-    record_load(auto_id, period, table_name, f.filename, None, rows)
+    record_load(auto_id, period, table_name, f.filename, None, rows,
+                source_rows=source_rows, source_columns=source_columns, source_path=f.filename)
     return [SheetMapping(
         sheet_pattern='', table_name=table_name, table_description=table_desc, column_mappings=learned_mappings,
         column_descriptions=col_descriptions, column_types=col_types, grain=grain, grain_column=grain_col, grain_description=grain_desc,
@@ -376,6 +430,9 @@ def _bootstrap_impl(url: str, name: Optional[str], pipeline_id: Optional[str], e
     auto_name, auto_id = name or classification.name, pipeline_id or classification.publication_id
     file_patterns, temp_dir = [], tempfile.mkdtemp()
 
+    # Initialize table name collision registry for this bootstrap session
+    name_registry = _TableNameRegistry()
+
     # Check which tables exist BEFORE loading (to distinguish created vs updated)
     tables_before_load = set()
     with get_connection() as conn:
@@ -407,7 +464,7 @@ def _bootstrap_impl(url: str, name: Optional[str], pipeline_id: Optional[str], e
             console.print(f"\n[highlight]Schema group ({len(group)} files, type: {file_type}): {unquote(rep_file.filename)}[/]")
 
             # Enrich using representative
-            mappings = _process_csv(rep_path, rep_file, rep_file.period or latest, auto_id, enrich, file_type)
+            mappings = _process_csv(rep_path, rep_file, rep_file.period or latest, auto_id, enrich, file_type, name_registry)
             if not mappings:
                 continue
             mapping = mappings[0]  # CSV produces single mapping
@@ -431,14 +488,20 @@ def _bootstrap_impl(url: str, name: Optional[str], pipeline_id: Optional[str], e
         console.print(f"\n[highlight]Processing: {unquote(f.filename)}[/] (period: {file_period})")
 
         if f.file_type in ['xlsx', 'xls']:
-            mappings, file_context = _process_excel(local_path, f, file_period, auto_id, enrich, skip_unknown)
+            mappings, file_context = _process_excel(local_path, f, file_period, auto_id, enrich, skip_unknown, name_registry)
             if file_context and not extracted_file_context:
                 extracted_file_context = file_context  # Store first file's context
         elif f.file_type == 'zip':
-            results = process_data_file(local_path, f.filename, 'zip', file_period, auto_id, enrich, console)
+            results = process_data_file(local_path, f.filename, 'zip', file_period, auto_id, enrich, console,
+                                        name_registry=name_registry)
             mappings = [m for m, _ in results]
             for m, rows in results:
-                record_load(auto_id, file_period, m.table_name, f.filename, m.sheet_pattern or f.filename, rows)
+                # Use source metrics if available (attached by file_processor)
+                source_rows = getattr(m, '_source_rows', None)
+                source_columns = getattr(m, '_source_columns', None)
+                source_path = getattr(m, '_source_path', m.sheet_pattern or f.filename)
+                record_load(auto_id, file_period, m.table_name, f.filename, m.sheet_pattern or f.filename, rows,
+                            source_rows=source_rows, source_columns=source_columns, source_path=source_path)
         else:
             mappings = []
 

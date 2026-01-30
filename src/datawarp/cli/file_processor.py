@@ -11,6 +11,39 @@ from urllib.parse import unquote
 
 import pandas as pd
 
+
+def _deduplicate_files(file_paths: List[str]) -> List[str]:
+    """Deduplicate CSV/XLSX pairs, keeping XLSX (richer format).
+
+    Groups files by base name (without extension and format suffix like _csv/_xlsx),
+    returns only the preferred format from each group.
+    """
+    # Priority: xlsx > xls > csv (lower = better)
+    PRIORITY = {'.xlsx': 1, '.xls': 2, '.csv': 3}
+
+    groups = {}
+    for path in file_paths:
+        name = os.path.basename(path)
+        # Remove extension and format suffix: "file_Aug24_csv.csv" → "file_Aug24"
+        base = re.sub(r'_(csv|xlsx|xls)?\.(csv|xlsx|xls)$', '', name, flags=re.I)
+        # Also remove date range suffix for grouping: "file_Sep24-Aug25" → "file"
+        base = re.sub(r'_[A-Za-z]{3}\d{2}-[A-Za-z]{3}\d{2}$', '', base)
+
+        if base not in groups:
+            groups[base] = []
+        groups[base].append(path)
+
+    # Select preferred format from each group
+    result = []
+    for paths in groups.values():
+        if len(paths) == 1:
+            result.append(paths[0])
+        else:
+            best = min(paths, key=lambda p: PRIORITY.get(os.path.splitext(p)[1].lower(), 99))
+            result.append(best)
+
+    return result
+
 from datawarp.loader import (
     load_sheet, load_file, download_file, get_sheet_names,
     extract_zip, list_zip_contents, FileExtractor,
@@ -29,12 +62,21 @@ def _enrich_and_load(
     enrich: bool,
     console,
     is_csv: bool = False,
-) -> Tuple[SheetMapping, int]:
-    """Common enrichment and loading logic for both CSV and Excel files."""
+    name_registry=None,
+    source_context: str = None,
+) -> Tuple[SheetMapping, int, int, int]:
+    """Common enrichment and loading logic for both CSV and Excel files.
+
+    Returns: (SheetMapping, rows_loaded, source_rows, source_columns)
+    """
+    # Track source metrics for reconciliation
+    source_rows = len(df)
+    source_columns = len(df.columns)
+
     grain_info = detect_grain(df)
     grain, grain_col, grain_desc = grain_info['grain'], grain_info['grain_column'], grain_info['description']
 
-    table_name = make_table_name(auto_id, sheet_name)
+    suggested_name = make_table_name(auto_id, sheet_name)
     table_desc = f"Data from {sheet_name}"
     sanitized_cols = [sanitize_name(str(c)) for c in df.columns]
     col_mappings = {c: c for c in sanitized_cols}
@@ -49,11 +91,16 @@ def _enrich_and_load(
             publication_hint=auto_id, grain_hint=grain,
             pipeline_id=auto_id, source_file=local_path
         )
-        table_name = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
+        suggested_name = f"tbl_{sanitize_name(enriched['table_name'])}"[:63]
         table_desc = enriched['table_description']
         col_mappings = enriched['columns']
         col_descriptions = enriched['descriptions']
-        console.print(f"{'  ' if is_csv else '    '}[success]LLM suggested: {table_name}[/]")
+        console.print(f"{'  ' if is_csv else '    '}[success]LLM suggested: {suggested_name}[/]")
+
+    # Resolve collisions if registry provided
+    table_name = name_registry.register(suggested_name, source_context or local_path) if name_registry else suggested_name
+    if table_name != suggested_name:
+        console.print(f"{'  ' if is_csv else '    '}[warning]Name collision resolved: → {table_name}[/]")
 
     # Load data
     if is_csv:
@@ -75,13 +122,14 @@ def _enrich_and_load(
             column_mappings=learned_mappings, column_descriptions=col_descriptions,
             column_types=col_types, grain=grain,
             grain_column=grain_col, grain_description=grain_desc,
-        ), rows
-    return None, 0
+        ), rows, source_rows, source_columns
+    return None, 0, source_rows, source_columns
 
 
 def process_data_file(
     local_path: str, filename: str, file_type: str,
     period: str, auto_id: str, enrich: bool, console,
+    name_registry=None,
 ) -> List[Tuple[SheetMapping, int]]:
     """
     Process a single data file (CSV, Excel, or ZIP) and return sheet mappings.
@@ -92,14 +140,24 @@ def process_data_file(
     if file_type == 'zip':
         console.print("  [muted]Extracting ZIP contents...[/]")
         zip_contents = list_zip_contents(local_path)
-        console.print(f"  Found {len(zip_contents)} data files in ZIP")
+        extracted_paths = list(extract_zip(local_path))
+        original_count = len(extracted_paths)
 
-        for extracted_path in extract_zip(local_path):
+        # Deduplicate CSV/XLSX pairs (prefer XLSX)
+        extracted_paths = _deduplicate_files(extracted_paths)
+        if len(extracted_paths) < original_count:
+            skipped = original_count - len(extracted_paths)
+            console.print(f"  Found {original_count} files, deduped to {len(extracted_paths)} (skipped {skipped} duplicate formats)")
+        else:
+            console.print(f"  Found {len(extracted_paths)} data files in ZIP")
+
+        for extracted_path in extracted_paths:
             ext_filename = os.path.basename(extracted_path)
             ext_type = os.path.splitext(ext_filename)[1].lower().lstrip('.')
             console.print(f"\n  [bold white]-> {ext_filename}[/]")
             results.extend(process_data_file(
-                extracted_path, ext_filename, ext_type, period, auto_id, enrich, console
+                extracted_path, ext_filename, ext_type, period, auto_id, enrich, console,
+                name_registry=name_registry
             ))
         return results
 
@@ -113,10 +171,15 @@ def process_data_file(
                 df = extractor.to_dataframe()
                 if df.empty:
                     continue
-                result, rows = _enrich_and_load(
-                    df, sheet, local_path, auto_id, period, enrich, console
+                result, rows, source_rows, source_columns = _enrich_and_load(
+                    df, sheet, local_path, auto_id, period, enrich, console,
+                    name_registry=name_registry, source_context=f"{filename}/{sheet}"
                 )
                 if result:
+                    # Store source metrics with result for record_load
+                    result._source_rows = source_rows
+                    result._source_columns = source_columns
+                    result._source_path = f"{filename}/{sheet}"
                     results.append((result, rows))
             except Exception as e:
                 console.print(f"    [muted]{sheet}: skipped ({e})[/]")
@@ -130,10 +193,15 @@ def process_data_file(
             return results
 
         sheet_name = os.path.splitext(filename)[0]
-        result, rows = _enrich_and_load(
-            df, sheet_name, local_path, auto_id, period, enrich, console, is_csv=True
+        result, rows, source_rows, source_columns = _enrich_and_load(
+            df, sheet_name, local_path, auto_id, period, enrich, console, is_csv=True,
+            name_registry=name_registry, source_context=filename
         )
         if result:
+            # Store source metrics with result for record_load
+            result._source_rows = source_rows
+            result._source_columns = source_columns
+            result._source_path = filename
             results.append((result, rows))
         return results
 

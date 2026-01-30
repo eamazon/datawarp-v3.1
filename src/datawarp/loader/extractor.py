@@ -227,37 +227,45 @@ class FileExtractor:
         return self._structure
 
     def _classify_sheet(self) -> SheetType:
-        """Classify sheet type."""
+        """Classify sheet type with smart tabular detection.
+
+        Uses data density and row structure analysis to distinguish real
+        tabular data from documentation/metadata sheets (like NHS data definitions).
+        """
         if self.ws.max_row < 2 or self.ws.max_column < 2:
             return SheetType.EMPTY
 
-        multi_cell_rows = 0
-        single_cell_rows = 0
-
-        for row in range(1, min(30, self.ws.max_row + 1)):
+        # Analyze first 30 rows for density and structure
+        empty, single, multi, total_cells = 0, 0, 0, 0
+        for row in range(1, min(31, self.ws.max_row + 1)):
             cells = sum(1 for col in range(1, min(20, self.ws.max_column + 1))
                         if self.ws.cell(row=row, column=col).value is not None)
-            if cells >= 3:
-                multi_cell_rows += 1
-                if multi_cell_rows >= 3:
-                    return SheetType.TABULAR
-            elif cells == 1:
-                single_cell_rows += 1
+            total_cells += cells
+            if cells == 0:
+                empty += 1
+            elif cells <= 2:
+                single += 1
+            else:
+                multi += 1
 
-        if multi_cell_rows >= 3:
-            return SheetType.TABULAR
+        # Calculate metrics
+        sample_rows = min(30, self.ws.max_row)
+        density = total_cells / (sample_rows * 10) if sample_rows > 0 else 0
+        single_ratio = single / max(1, single + multi)
 
+        # Low density (<15%) OR high single-cell ratio (>50%) with few multi-cell rows = documentation
+        if density < 0.15 or (single_ratio > 0.5 and multi < 5):
+            return SheetType.METADATA
+
+        # Check first cell for metadata indicators
         first_val = self.ws.cell(row=1, column=1).value
         if first_val:
             val_lower = str(first_val).lower()
             if any(ind in val_lower for ind in self.METADATA_INDICATORS):
-                if multi_cell_rows < 2:
+                if multi < 3:
                     return SheetType.METADATA
 
-        if single_cell_rows > multi_cell_rows * 2 and multi_cell_rows < 3:
-            return SheetType.METADATA
-
-        return SheetType.TABULAR if multi_cell_rows >= 2 else SheetType.METADATA
+        return SheetType.TABULAR if multi >= 3 else SheetType.METADATA
 
     def _detect_all_header_rows(self) -> List[int]:
         """Detect header rows - handles multi-row headers."""

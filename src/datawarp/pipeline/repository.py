@@ -65,20 +65,28 @@ def record_load(
     table_name: str,
     source_file: str,
     sheet_name: Optional[str],
-    rows_loaded: int
+    rows_loaded: int,
+    source_rows: Optional[int] = None,
+    source_columns: Optional[int] = None,
+    source_path: Optional[str] = None,
 ) -> None:
-    """Record a successful data load."""
+    """Record a successful data load with source metrics for reconciliation."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO datawarp.tbl_load_history
-                (pipeline_id, period, table_name, source_file, sheet_name, rows_loaded)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                (pipeline_id, period, table_name, source_file, sheet_name, rows_loaded,
+                 source_rows, source_columns, source_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (pipeline_id, period, table_name, sheet_name)
                 DO UPDATE SET
                     rows_loaded = EXCLUDED.rows_loaded,
+                    source_rows = EXCLUDED.source_rows,
+                    source_columns = EXCLUDED.source_columns,
+                    source_path = EXCLUDED.source_path,
                     loaded_at = NOW()
-            """, (pipeline_id, period, table_name, source_file, sheet_name, rows_loaded))
+            """, (pipeline_id, period, table_name, source_file, sheet_name, rows_loaded,
+                  source_rows, source_columns, source_path))
 
 
 def get_load_history(pipeline_id: str) -> List[dict]:

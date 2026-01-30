@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS datawarp.tbl_load_history (
     source_file TEXT,
     sheet_name VARCHAR(100),
     rows_loaded INT,
+    -- Reconciliation columns (source vs loaded)
+    source_rows INT,           -- Row count in original file/sheet
+    source_columns INT,        -- Column count in original file/sheet
+    source_path TEXT,          -- Full path within archive (for ZIPs)
     loaded_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(pipeline_id, period, table_name, sheet_name)
 );
@@ -110,6 +114,17 @@ CREATE INDEX IF NOT EXISTS idx_cli_runs_status
 ON datawarp.tbl_cli_runs(status);
 
 -- ============================================================================
+-- MIGRATIONS (for existing databases)
+-- ============================================================================
+-- These ALTER statements add columns if they don't exist (idempotent)
+-- Must run BEFORE views that reference these columns
+
+-- Add reconciliation columns to tbl_load_history
+ALTER TABLE datawarp.tbl_load_history ADD COLUMN IF NOT EXISTS source_rows INT;
+ALTER TABLE datawarp.tbl_load_history ADD COLUMN IF NOT EXISTS source_columns INT;
+ALTER TABLE datawarp.tbl_load_history ADD COLUMN IF NOT EXISTS source_path TEXT;
+
+-- ============================================================================
 -- METADATA VIEWS (for easy querying)
 -- ============================================================================
 
@@ -159,6 +174,28 @@ FROM datawarp.tbl_pipeline_configs pc,
      jsonb_array_elements(pc.config->'file_patterns') as fp,
      jsonb_array_elements(fp->'sheet_mappings') as m,
      jsonb_each_text(m->'column_mappings') as col;
+
+-- View: Load reconciliation (compare source vs loaded rows)
+DROP VIEW IF EXISTS datawarp.v_load_reconciliation CASCADE;
+CREATE VIEW datawarp.v_load_reconciliation AS
+SELECT
+    pipeline_id,
+    period,
+    table_name,
+    source_file,
+    source_path,
+    source_rows,
+    source_columns,
+    rows_loaded,
+    CASE
+        WHEN source_rows IS NULL THEN 'no_source_info'
+        WHEN source_rows = rows_loaded THEN 'match'
+        WHEN source_rows > rows_loaded THEN 'rows_lost'
+        ELSE 'rows_added'
+    END as reconciliation_status,
+    source_rows - rows_loaded as row_difference,
+    loaded_at
+FROM datawarp.tbl_load_history;
 
 -- View: Load statistics per table
 DROP VIEW IF EXISTS datawarp.v_table_stats CASCADE;
