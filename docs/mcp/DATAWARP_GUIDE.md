@@ -1387,6 +1387,9 @@ Drop existing tables before re-bootstrap? [Y/n]: y
 - Re-bootstrap offers to drop old tables to avoid duplicates (LLM may generate different names)
 - Two-stage enrichment: extracts context from Notes/Contents sheets first, uses it for better naming
 - Config stores `file_context` for MCP access to KPI definitions
+- **ZIP processing:** Deduplicates CSV/XLSX pairs (keeps XLSX), detects documentation files
+- **Collision prevention:** If LLM suggests same table name for different files, auto-generates unique suffix (e.g., `tbl_trust_shmi` → `tbl_trust_shmi_site`)
+- **Source tracking:** Records source_rows and source_path for reconciliation via `v_load_reconciliation`
 
 ---
 
