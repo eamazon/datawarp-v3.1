@@ -1894,9 +1894,3 @@ FROM staging.your_table;
 | Grain before enrich | Skip useless sheets (notes, methodology) early |
 | Append-only loading | `period` column tracks data across time |
 | Enrichment logging | Full observability of LLM costs and suggestions |
-
----
-
-## Archived Documentation
-
-Historical design docs and specs are preserved in `docs/archive/`.
