@@ -3,6 +3,8 @@ Reset command - clear loaded data while preserving enrichment mappings.
 
 Clears staging tables and load history, but keeps the expensive LLM-generated
 table names and column mappings in the pipeline config.
+
+Use --delete to completely remove the pipeline including config and enrichment logs.
 """
 import click
 from rich.panel import Panel
@@ -17,8 +19,11 @@ from datawarp.storage import get_connection
 @click.command('reset')
 @click.option('--pipeline', '-p', required=True, help='Pipeline ID to reset')
 @click.option('--yes', '-y', is_flag=True, help='Skip confirmation prompt')
-def reset_command(pipeline: str, yes: bool):
-    """Clear loaded data while keeping enrichment mappings."""
+@click.option('--delete', is_flag=True, help='Completely remove pipeline including config and enrichment logs')
+def reset_command(pipeline: str, yes: bool, delete: bool):
+    """Clear loaded data while keeping enrichment mappings.
+
+    Use --delete to completely remove the pipeline including enrichment."""
     config = load_config(pipeline)
     if not config:
         console.print(f"[error]Pipeline '{pipeline}' not found[/]")
@@ -60,10 +65,16 @@ def reset_command(pipeline: str, yes: bool):
     console.print("\n[bold]This will:[/]")
     console.print("  1. Drop staging tables listed above")
     console.print("  2. Clear load history for this pipeline")
-    console.print("  3. Reset loaded_periods to empty")
-    console.print("\n[success]Preserved:[/] table names, column mappings, descriptions (enrichment)")
+    if delete:
+        console.print("  3. Delete enrichment logs")
+        console.print("  4. Delete CLI run history")
+        console.print("  5. Delete pipeline config")
+        console.print("\n[warning]This is permanent - enrichment will need to be regenerated![/]")
+    else:
+        console.print("  3. Reset loaded_periods to empty")
+        console.print("\n[success]Preserved:[/] table names, column mappings, descriptions (enrichment)")
 
-    if not yes and not Confirm.ask("\nProceed with reset?", default=False):
+    if not yes and not Confirm.ask("\nProceed?", default=False):
         console.print("[muted]Cancelled[/]")
         return
 
@@ -79,10 +90,25 @@ def reset_command(pipeline: str, yes: bool):
             cur.execute("DELETE FROM datawarp.tbl_load_history WHERE pipeline_id = %s", (pipeline,))
             console.print(f"  [muted]Cleared load history[/]")
 
-    # Reset loaded_periods in config (keeps everything else)
-    config.loaded_periods = []
-    save_config(config)
-    console.print(f"  [muted]Reset loaded_periods[/]")
+            if delete:
+                # Delete enrichment logs
+                cur.execute("DELETE FROM datawarp.tbl_enrichment_log WHERE pipeline_id = %s", (pipeline,))
+                console.print(f"  [muted]Deleted enrichment logs[/]")
 
-    console.print(f"\n[success]Reset complete![/]")
-    console.print(f"\nTo reload data: [bold]python scripts/pipeline.py scan --pipeline {pipeline}[/]")
+                # Delete CLI run history
+                cur.execute("DELETE FROM datawarp.tbl_cli_runs WHERE pipeline_id = %s", (pipeline,))
+                console.print(f"  [muted]Deleted CLI run history[/]")
+
+                # Delete pipeline config
+                cur.execute("DELETE FROM datawarp.tbl_pipeline_configs WHERE pipeline_id = %s", (pipeline,))
+                console.print(f"  [muted]Deleted pipeline config[/]")
+
+                console.print(f"\n[success]Pipeline '{pipeline}' completely removed![/]")
+            else:
+                # Reset loaded_periods in config (keeps everything else)
+                config.loaded_periods = []
+                save_config(config)
+                console.print(f"  [muted]Reset loaded_periods[/]")
+
+                console.print(f"\n[success]Reset complete![/]")
+                console.print(f"\nTo reload data: [bold]python scripts/pipeline.py scan --pipeline {pipeline}[/]")

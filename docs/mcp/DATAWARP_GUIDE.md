@@ -1337,7 +1337,7 @@ Complete reference for all DataWarp CLI commands with detailed examples and nuan
 | `bootstrap` | Initial setup from NHS URL | Yes (if `--enrich`) | Creates new |
 | `scan` | Load newly published periods | No | Updates `loaded_periods` |
 | `backfill` | Load historical periods | No | Updates `loaded_periods` |
-| `reset` | Clear data, keep enrichment | No | Clears `loaded_periods` |
+| `reset` | Clear data, keep enrichment | No | Clears `loaded_periods` (or deletes all with `--delete`) |
 | `enrich` | Fill empty column descriptions | Yes | Updates mappings |
 | `add-sheet` | Add new sheet to pipeline | Yes (if `--enrich`) | Adds sheet mapping |
 | `list` | Show all pipelines | No | No |
@@ -1513,7 +1513,7 @@ Loading period: 2023-04
 **Purpose:** Clear loaded data while preserving expensive LLM-generated enrichment (table names, column mappings, descriptions).
 
 ```bash
-python scripts/pipeline.py reset --pipeline <ID> [--yes]
+python scripts/pipeline.py reset --pipeline <ID> [--yes] [--delete]
 ```
 
 **Options:**
@@ -1521,19 +1521,28 @@ python scripts/pipeline.py reset --pipeline <ID> [--yes]
 |--------|-------------|
 | `--pipeline` | Pipeline ID (required) |
 | `--yes`, `-y` | Skip confirmation prompt |
+| `--delete` | Completely remove pipeline including config and enrichment logs |
 
-**What reset does:**
+**What reset does (without --delete):**
 1. Drops staging tables for the pipeline
 2. Clears `tbl_load_history` for the pipeline
 3. Sets `config.loaded_periods = []`
 
-**What reset preserves:**
+**What reset preserves (without --delete):**
 - `table_name` (LLM-generated)
 - `table_description` (LLM-generated)
 - `column_mappings` (LLM-generated)
 - `column_descriptions` (LLM-generated)
 - `file_patterns`, `sheet_mappings`
 - `file_context` (extracted KPIs, methodology)
+
+**What --delete removes (everything):**
+- All of the above staging tables and history
+- Pipeline config from `tbl_pipeline_configs`
+- Enrichment logs from `tbl_enrichment_log`
+- CLI run history from `tbl_cli_runs`
+
+Use `--delete` when you want to completely start over with a fresh bootstrap.
 
 **Example output:**
 ```
