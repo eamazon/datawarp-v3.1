@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 from .column_compressor import compress_columns, expand_columns
-from .canonicalize import remove_date_patterns
+from .canonicalize import remove_date_patterns, extract_temporal_qualifier
 
 load_dotenv()
 
@@ -72,6 +72,7 @@ def enrich_sheet(
 
     # Build context section from file_context (extracted from metadata sheets)
     context_section = ""
+    sheet_desc = ""
     if file_context:
         # Sheet description from Contents/TOC
         sheet_desc = file_context.get('sheets', {}).get(sheet_name, '')
@@ -201,8 +202,13 @@ Column rules:
             result = expand_columns(result, pattern_info)
 
         # Remove date patterns from table name for cross-period consistency
+        # BUT preserve intra-file temporal qualifiers (Q1/Q2/YTD from sheet description)
         if 'table_name' in result:
             result['table_name'] = remove_date_patterns(result['table_name'])
+            # Re-append temporal qualifier if sheet has intra-file temporal distinction
+            temporal_qualifier = extract_temporal_qualifier(sheet_desc)
+            if temporal_qualifier and not result['table_name'].endswith(f'_{temporal_qualifier}'):
+                result['table_name'] = f"{result['table_name']}_{temporal_qualifier}"
 
         # Log successful call
         log_data['success'] = True

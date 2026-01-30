@@ -2,9 +2,44 @@
 
 Ensures cross-period consolidation by stripping temporal identifiers
 from LLM-generated source codes and column names, enabling consistent naming.
+
+IMPORTANT: Intra-file temporal qualifiers (Q1 vs Q2 sheets in same file) are
+preserved via extract_temporal_qualifier() - these are different from cross-period
+patterns which should be stripped.
 """
 import re
 from typing import List, Set, Tuple, Optional
+
+
+def extract_temporal_qualifier(sheet_description: str) -> Optional[str]:
+    """Extract temporal qualifier from sheet description for intra-file distinction.
+
+    When sheets in the same file represent different temporal aggregations
+    (Q1, Q2, YTD, etc.), we need to preserve this in the table name to avoid
+    collisions. Cross-period dates (Jan 2025 vs Feb 2025) are still stripped.
+
+    Returns: 'q1', 'q2', 'q3', 'q4', 'ytd', or None
+    """
+    if not sheet_description:
+        return None
+
+    desc_lower = sheet_description.lower()
+
+    # Check for quarter patterns
+    if 'quarter 1' in desc_lower or ', q1' in desc_lower:
+        return 'q1'
+    if 'quarter 2' in desc_lower or ', q2' in desc_lower:
+        return 'q2'
+    if 'quarter 3' in desc_lower or ', q3' in desc_lower:
+        return 'q3'
+    if 'quarter 4' in desc_lower or ', q4' in desc_lower:
+        return 'q4'
+
+    # Check for year-to-date
+    if 'year to date' in desc_lower or 'year-to-date' in desc_lower or ' ytd' in desc_lower:
+        return 'ytd'
+
+    return None
 
 # Tokens that indicate date/time information (filtered during semantic comparison)
 DATE_TOKENS: Set[str] = {

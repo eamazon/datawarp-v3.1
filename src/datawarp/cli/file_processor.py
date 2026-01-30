@@ -12,8 +12,11 @@ from urllib.parse import unquote
 import pandas as pd
 
 
-def _deduplicate_files(file_paths: List[str]) -> List[str]:
+def _deduplicate_files(file_tuples: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     """Deduplicate CSV/XLSX pairs, keeping XLSX (richer format).
+
+    Args:
+        file_tuples: List of (extracted_path, relative_path_in_zip) tuples
 
     Groups files by base name (without extension and format suffix like _csv/_xlsx),
     returns only the preferred format from each group.
@@ -22,8 +25,8 @@ def _deduplicate_files(file_paths: List[str]) -> List[str]:
     PRIORITY = {'.xlsx': 1, '.xls': 2, '.csv': 3}
 
     groups = {}
-    for path in file_paths:
-        name = os.path.basename(path)
+    for extracted_path, relative_path in file_tuples:
+        name = os.path.basename(relative_path)
         # Remove extension and format suffix: "file_Aug24_csv.csv" → "file_Aug24"
         base = re.sub(r'_(csv|xlsx|xls)?\.(csv|xlsx|xls)$', '', name, flags=re.I)
         # Also remove date range suffix for grouping: "file_Sep24-Aug25" → "file"
@@ -31,15 +34,15 @@ def _deduplicate_files(file_paths: List[str]) -> List[str]:
 
         if base not in groups:
             groups[base] = []
-        groups[base].append(path)
+        groups[base].append((extracted_path, relative_path))
 
     # Select preferred format from each group
     result = []
-    for paths in groups.values():
-        if len(paths) == 1:
-            result.append(paths[0])
+    for tuples in groups.values():
+        if len(tuples) == 1:
+            result.append(tuples[0])
         else:
-            best = min(paths, key=lambda p: PRIORITY.get(os.path.splitext(p)[1].lower(), 99))
+            best = min(tuples, key=lambda t: PRIORITY.get(os.path.splitext(t[0])[1].lower(), 99))
             result.append(best)
 
     return result
@@ -129,35 +132,40 @@ def _enrich_and_load(
 def process_data_file(
     local_path: str, filename: str, file_type: str,
     period: str, auto_id: str, enrich: bool, console,
-    name_registry=None,
+    name_registry=None, zip_context: str = None,
 ) -> List[Tuple[SheetMapping, int]]:
     """
     Process a single data file (CSV, Excel, or ZIP) and return sheet mappings.
     For ZIP files, extracts and recursively processes each data file inside.
+
+    Args:
+        zip_context: For files extracted from ZIP, the context string like
+            "zipfile.zip/folder/subfolder" to build full source_path provenance.
     """
     results = []
 
     if file_type == 'zip':
         console.print("  [muted]Extracting ZIP contents...[/]")
         zip_contents = list_zip_contents(local_path)
-        extracted_paths = list(extract_zip(local_path))
-        original_count = len(extracted_paths)
+        extracted_tuples = list(extract_zip(local_path))
+        original_count = len(extracted_tuples)
 
         # Deduplicate CSV/XLSX pairs (prefer XLSX)
-        extracted_paths = _deduplicate_files(extracted_paths)
-        if len(extracted_paths) < original_count:
-            skipped = original_count - len(extracted_paths)
-            console.print(f"  Found {original_count} files, deduped to {len(extracted_paths)} (skipped {skipped} duplicate formats)")
+        extracted_tuples = _deduplicate_files(extracted_tuples)
+        if len(extracted_tuples) < original_count:
+            skipped = original_count - len(extracted_tuples)
+            console.print(f"  Found {original_count} files, deduped to {len(extracted_tuples)} (skipped {skipped} duplicate formats)")
         else:
-            console.print(f"  Found {len(extracted_paths)} data files in ZIP")
+            console.print(f"  Found {len(extracted_tuples)} data files in ZIP")
 
-        for extracted_path in extracted_paths:
-            ext_filename = os.path.basename(extracted_path)
-            ext_type = os.path.splitext(ext_filename)[1].lower().lstrip('.')
-            console.print(f"\n  [bold white]-> {ext_filename}[/]")
+        for extracted_path, relative_path in extracted_tuples:
+            ext_type = os.path.splitext(relative_path)[1].lower().lstrip('.')
+            console.print(f"\n  [bold white]-> {relative_path}[/]")
+            # Build ZIP context: "zipfile.zip/folder/file.xlsx"
+            new_zip_context = f"{filename}/{relative_path}"
             results.extend(process_data_file(
-                extracted_path, ext_filename, ext_type, period, auto_id, enrich, console,
-                name_registry=name_registry
+                extracted_path, os.path.basename(relative_path), ext_type, period, auto_id, enrich, console,
+                name_registry=name_registry, zip_context=new_zip_context
             ))
         return results
 
@@ -171,15 +179,17 @@ def process_data_file(
                 df = extractor.to_dataframe()
                 if df.empty:
                     continue
+                # Build source context with ZIP path if from archive
+                source_ctx = f"{zip_context}/{sheet}" if zip_context else f"{filename}/{sheet}"
                 result, rows, source_rows, source_columns = _enrich_and_load(
                     df, sheet, local_path, auto_id, period, enrich, console,
-                    name_registry=name_registry, source_context=f"{filename}/{sheet}"
+                    name_registry=name_registry, source_context=source_ctx
                 )
                 if result:
                     # Store source metrics with result for record_load
                     result._source_rows = source_rows
                     result._source_columns = source_columns
-                    result._source_path = f"{filename}/{sheet}"
+                    result._source_path = source_ctx
                     results.append((result, rows))
             except Exception as e:
                 console.print(f"    [muted]{sheet}: skipped ({e})[/]")
@@ -188,20 +198,29 @@ def process_data_file(
     else:  # CSV
         try:
             df = pd.read_csv(local_path, low_memory=False)
+        except pd.errors.ParserError:
+            # Malformed rows (often footers) - silently skip
+            try:
+                df = pd.read_csv(local_path, low_memory=False, on_bad_lines='skip')
+            except Exception as e2:
+                console.print(f"  [error]Error reading CSV: {e2}[/]")
+                return results
         except Exception as e:
             console.print(f"  [error]Error reading: {e}[/]")
             return results
 
         sheet_name = os.path.splitext(filename)[0]
+        # Use ZIP context if from archive, otherwise just filename
+        source_ctx = zip_context if zip_context else filename
         result, rows, source_rows, source_columns = _enrich_and_load(
             df, sheet_name, local_path, auto_id, period, enrich, console, is_csv=True,
-            name_registry=name_registry, source_context=filename
+            name_registry=name_registry, source_context=source_ctx
         )
         if result:
             # Store source metrics with result for record_load
             result._source_rows = source_rows
             result._source_columns = source_columns
-            result._source_path = filename
+            result._source_path = source_ctx
             results.append((result, rows))
         return results
 

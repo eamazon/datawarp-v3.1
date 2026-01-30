@@ -27,9 +27,38 @@ def _extract_month_year(text: str) -> Optional[Tuple[str, str]]:
     """Smart extraction of month and year from text.
 
     Handles any order/format: "december 2025", "2025-12", "31-dec-2025", "122025", etc.
+    Also handles quarterly patterns: "q2-2526" (Q2 of FY 2025-26), "q1-25", "q3-2025".
     Returns (year, month) tuple or None.
     """
     text_lower = text.lower()
+
+    # Try quarterly pattern first (q1-2526, q2-25, q3-2025)
+    # UK Financial Year: Q1=Apr, Q2=Jul, Q3=Oct, Q4=Jan(next year)
+    quarter_match = re.search(r'q([1-4])[-_\s]?(\d{2,4})', text_lower)
+    if quarter_match:
+        quarter = int(quarter_match.group(1))
+        year_part = quarter_match.group(2)
+
+        # Handle financial year format (2526 = FY 2025-26)
+        if len(year_part) == 4 and not year_part.startswith('20'):
+            # Format: 2526 → FY 2025-26, first year is 20XX
+            year = f"20{year_part[:2]}"
+        elif len(year_part) == 2:
+            # Format: 25 → 2025
+            year = f"20{year_part}"
+        else:
+            # Format: 2025
+            year = year_part
+
+        # Quarter to month (first month of quarter)
+        quarter_months = {'1': '04', '2': '07', '3': '10', '4': '01'}
+        month = quarter_months[str(quarter)]
+
+        # Q4 belongs to the following calendar year
+        if quarter == 4:
+            year = str(int(year) + 1)
+
+        return (year, month)
 
     # Try to find month name
     month_match = re.search(rf'({MONTH_PATTERN})', text_lower)
@@ -87,6 +116,8 @@ def parse_period(text: str) -> Optional[str]:
     - 202411 (YYYYMM compact)
     - 122025 (MMYYYY compact)
     - nov25 (abbreviated)
+    - q2-2526 (quarterly, UK FY 2025-26 Q2 → 2025-07)
+    - q1-25, q3-2025 (quarterly variants)
 
     Returns None if no period found.
     """

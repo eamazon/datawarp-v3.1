@@ -308,7 +308,56 @@ class TestCCGGrain:
 
 
 # ============================================================================
-# Test 7: Empty DataFrame
+# Test 7: Local Authority/Borough Data (Synthetic)
+# ============================================================================
+
+class TestLocalAuthorityGrain:
+    """Test detection of Local Authority/Borough level data."""
+
+    def test_local_authority_codes_detected(self):
+        """DataFrame with E09 codes (London Borough) should detect grain='local_authority'."""
+        df = pd.DataFrame({
+            'Local Authority Code': ['E09000008', 'E09000007', 'E09000001', 'E09000002'],
+            'Local Authority Name': ['Croydon', 'Camden', 'City of London', 'Barking and Dagenham'],
+            'Smoking Rate': [10.5, 8.2, 6.1, 12.3]
+        })
+
+        result = detect_grain(df)
+
+        assert result['grain'] == 'local_authority', f"Expected grain='local_authority', got '{result['grain']}'"
+        assert result['confidence'] >= 0.5
+
+    def test_mixed_local_authority_types(self):
+        """DataFrame with mixed LA types (E06, E07, E08, E09) should detect grain='local_authority'."""
+        df = pd.DataFrame({
+            'Area Code': ['E06000001', 'E07000026', 'E08000003', 'E09000008'],
+            'Area Name': ['Hartlepool', 'Allerdale', 'Manchester', 'Croydon'],
+            'Value': [100, 200, 300, 400]
+        })
+
+        result = detect_grain(df)
+
+        assert result['grain'] == 'local_authority', f"Expected grain='local_authority', got '{result['grain']}'"
+
+    def test_la_name_based_detection(self):
+        """Detect local authority by name keywords (Borough, Council, etc.)."""
+        df = pd.DataFrame({
+            'Geography': [
+                'London Borough of Croydon',
+                'London Borough of Camden',
+                'Manchester City Council',
+                'Birmingham City Council'
+            ],
+            'Metric': [10, 20, 30, 40]
+        })
+
+        result = detect_grain(df)
+
+        assert result['grain'] == 'local_authority', f"Expected grain='local_authority', got '{result['grain']}'"
+
+
+# ============================================================================
+# Test 8: Empty DataFrame
 # ============================================================================
 
 class TestEmptyDataFrame:
@@ -407,6 +456,61 @@ class TestPrimaryOrgColumnPreference:
         assert result['grain'] == 'icb', f"Expected grain='icb', got '{result['grain']}'"
         assert result['grain_column'] == 'org_code', \
             f"Expected grain_column='org_code', got '{result['grain_column']}'"
+
+
+# ============================================================================
+# Test 10: ONS Geography Codes (E54, E40, E92)
+# ============================================================================
+
+class TestONSGeographyCodes:
+    """Test detection of ONS geography codes (E-codes) used in NHS data."""
+
+    def test_sub_icb_ons_codes_detected(self):
+        """DataFrame with E54 codes (ONS Sub-ICB) should detect grain='sub_icb'."""
+        df = pd.DataFrame({
+            'org_code': ['E54000027', 'E54000028', 'E54000029', 'E54000030'],
+            'sub_icb_name': ['Sub-ICB 1', 'Sub-ICB 2', 'Sub-ICB 3', 'Sub-ICB 4'],
+            'maternities': [5000, 3000, 4500, 3500]
+        })
+
+        result = detect_grain(df)
+
+        assert result['grain'] == 'sub_icb', f"Expected grain='sub_icb', got '{result['grain']}'"
+        assert result['confidence'] >= 0.5
+
+    def test_region_ons_codes_detected(self):
+        """DataFrame with E40 codes (ONS Region) should detect grain='region'."""
+        df = pd.DataFrame({
+            'Region Code': ['E40000003', 'E40000005', 'E40000006', 'E40000011'],
+            'Region Name': ['London', 'South East', 'South West', 'North East'],
+            'Population': [9000000, 9500000, 5700000, 2700000]
+        })
+
+        result = detect_grain(df)
+
+        assert result['grain'] == 'region', f"Expected grain='region', got '{result['grain']}'"
+
+    def test_hierarchical_table_with_ons_codes(self):
+        """Mixed E92/E40/E54 table should detect most granular grain (sub_icb)."""
+        # Simulates NHS hierarchical tables with national, region, and sub-icb rows
+        df = pd.DataFrame({
+            'org_code': [
+                'E92000001',  # National (England)
+                'E40000003', 'E40000005',  # Regions
+                'E54000027', 'E54000028', 'E54000029', 'E54000030',  # Sub-ICBs
+            ],
+            'org_name': [
+                'England',
+                'London', 'South East',
+                'Sub-ICB 1', 'Sub-ICB 2', 'Sub-ICB 3', 'Sub-ICB 4',
+            ],
+            'value': [100000, 20000, 25000, 3000, 4000, 5000, 6000]
+        })
+
+        result = detect_grain(df)
+
+        # Should detect sub_icb as the most common granular entity
+        assert result['grain'] == 'sub_icb', f"Expected grain='sub_icb', got '{result['grain']}'"
 
 
 # ============================================================================

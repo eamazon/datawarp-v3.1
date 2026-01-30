@@ -1,79 +1,51 @@
 # Current Tasks - DataWarp v3.1
 
-**Last Updated:** 2025-01-28 Session End
+**Last Updated:** 2025-01-30 Session End
 
 ---
 
-## Session Summary (2025-01-28)
+## Session Summary (2025-01-30)
 
 ### Completed This Session
 
-1. **CLI Refactoring** - Moved 1178-line pipeline.py into modular CLI structure
-   - `src/datawarp/cli/bootstrap.py` - Bootstrap command
-   - `src/datawarp/cli/scan.py` - Scan command
-   - `src/datawarp/cli/backfill.py` - Backfill command
-   - `src/datawarp/cli/list_history.py` - List and history commands
-   - `src/datawarp/cli/console.py` - Shared Rich console with theme
-   - `src/datawarp/cli/helpers.py` - Shared utilities
-   - `src/datawarp/cli/file_processor.py` - File processing logic
-   - `src/datawarp/cli/sheet_selector.py` - Sheet analysis UI
+1. **ONS Geography Code Detection** - Expanded grain detection for NHS hierarchical tables
+   - Added E54xxxxxx pattern for Sub-ICB ONS codes
+   - Added E40xxxxxx pattern for NHS Region ONS codes
+   - Added E92xxxxxx pattern for National (England) codes
+   - Tables 2a/2b/3 now correctly detected as `sub_icb` (were `national`)
 
-2. **Console Colors** - Fixed for light terminal backgrounds
-   - All colors now dark blue for readability
-   - Disabled Rich auto-highlighter that was causing cyan dates
+2. **Intra-File Temporal Qualifier Preservation** - Fixed table naming for Q1/Q2/YTD sheets
+   - Problem: `remove_date_patterns` was stripping Q1/Q2/YTD from table names
+   - Solution: Added `extract_temporal_qualifier()` to preserve intra-file distinctions
+   - Result: `tbl_subicb_smoking_q1`, `tbl_subicb_smoking_q2`, `tbl_subicb_smoking_ytd`
+   - No more ugly `_alt` and `_alt_1` collision-resolved names
 
-3. **Period URL Detection** - Fixed classifier for complex period URLs
-   - URLs like `/final-october-2025-provisional-november-2025-official-statistics` now detected
-   - Scrapes specific period URL instead of entire landing page
+3. **Enhanced Notes Sheet Metadata Extraction** - Gold dust from Notes & Definitions
+   - Added `definitions` field for precise clinical criteria
+   - Added `codes` field for SNOMED/ICD codes
+   - Enhanced prompt to extract timing windows, thresholds, inclusion criteria
+   - Now captures: "current smokers +/-3 days from labour onset date"
 
-4. **Existing Pipeline Detection** - Bootstrap now checks if pipeline exists
-   - Shows loaded periods and suggests using `scan` command
-   - Asks for confirmation before re-bootstrapping
+4. **MCP Metadata Enrichment** - Direct attachment of sheet metadata
+   - `get_schema` now includes: `source_sheet_description`, `clinical_definitions`, `classification_codes`
+   - `get_lineage` now includes: `source.sheet_description`
+   - Chatbots get full context without manual lookups
 
-5. **Multi-Period Selection** - When ≤3 periods, offers "all" option
-   - Can load files from multiple periods in one bootstrap
-   - Each file uses its own detected period
-
-6. **Column Type Fix** - Description columns now use TEXT not VARCHAR(255)
-   - Fixed truncation errors for long text fields
-
-7. **Smart Period Replace** - Loader deletes existing period data before insert
-   - Prevents duplicate rows when re-loading same period
-
-8. **Tables Created vs Updated** - Summary now distinguishes new vs existing tables
-
----
-
-## Pending Task: Multi-Period File Pattern Matching (Task #31)
-
-### Problem
-When bootstrapping 6 files (3 Oct + 3 Nov with same schemas), creates 6 tables instead of 3.
-
-### Root Cause
-Bootstrap processes each file independently instead of grouping by file type first.
-
-### Recommended Solution: Hybrid Deterministic Approach
+### Files Changed
 
 ```
-1. FILENAME GROUPING (deterministic)
-   Extract type: "msds-oct2025-exp-data.csv" → "data"
-   Group: {data: [oct, nov], measures: [...], dq: [...]}
-
-2. SCHEMA VALIDATION (safety check)
-   Verify files in each group have matching columns
-
-3. LLM ENRICHMENT (where it adds value)
-   Enrich ONE file per group, apply mapping to all
+Modified:
+- src/datawarp/metadata/grain.py (ONS geography patterns)
+- src/datawarp/metadata/canonicalize.py (extract_temporal_qualifier)
+- src/datawarp/metadata/enrich.py (preserve temporal qualifiers)
+- src/datawarp/metadata/file_context.py (definitions, codes fields)
+- scripts/mcp_server.py (clinical_definitions, classification_codes)
+- tests/test_grain_detection.py (ONS geography tests)
 ```
 
-### Why NOT Two-Phase LLM
-- NHS filenames follow predictable conventions
-- Deterministic grouping is faster, cheaper, more reliable
-- LLM only where it adds unique value (semantic naming)
+### Tests Added
 
-### Implementation
-- Refactor `_bootstrap_impl` to group files before processing
-- Add `src/datawarp/cli/file_grouper.py` for grouping logic
+- `TestONSGeographyCodes` - 3 tests for E54/E40/E92 code detection
 
 ---
 
@@ -82,36 +54,22 @@ Bootstrap processes each file independently instead of grouping by file type fir
 | Component | Status |
 |-----------|--------|
 | Discovery | ✅ Working |
-| Period Detection | ✅ Working |
-| Grain Detection | ✅ Working |
-| LLM Enrichment | ✅ Working |
+| Period Detection | ✅ Working (quarterly support) |
+| Grain Detection | ✅ Working (ONS codes, LA, Sub-ICB) |
+| LLM Enrichment | ✅ Working (temporal qualifiers preserved) |
+| Notes Extraction | ✅ Working (clinical definitions, codes) |
+| MCP Metadata | ✅ Working (full context attached) |
 | Data Loading | ✅ Working |
-| CLI Modular Structure | ✅ Working |
-| Multi-Period Bootstrap | ⚠️ Creates too many tables |
 
 ---
 
-## Next Session Priority
+## Pending: Multi-Period File Pattern Matching
 
-1. **Implement Task #31** - File pattern grouping for multi-period bootstrap
-2. **Test** - Verify 6 files → 3 tables with maternity data
+### Problem
+When bootstrapping 6 files (3 Oct + 3 Nov with same schemas), creates 6 tables instead of 3.
 
----
-
-## Files Changed This Session
-
-```
-Modified:
-- scripts/pipeline.py (reduced to thin CLI entry point)
-- src/datawarp/cli/*.py (all CLI modules)
-- src/datawarp/loader/excel.py (period replace, TEXT for descriptions)
-- src/datawarp/loader/extractor.py (TEXT for description columns)
-- src/datawarp/discovery/classifier.py (period URL detection fix)
-- src/datawarp/metadata/enrich.py (reverted band-aid changes)
-
-Created:
-- src/datawarp/tracking.py (run tracking)
-```
+### Recommended Solution
+Deterministic filename grouping before LLM enrichment - see previous session notes.
 
 ---
 
@@ -119,13 +77,30 @@ Created:
 
 ```bash
 cd /Users/speddi/projectx/datawarp-v3.1
+source .venv/bin/activate
 git status
 
-# Read Task #31 for context
-cat docs/tasks/CURRENT.md
+# Verify grain detection
+PYTHONPATH=src python -m pytest tests/test_grain_detection.py -v
 
-# Test current state
-python scripts/pipeline.py bootstrap \
-  --url https://digital.nhs.uk/.../maternity-services-monthly-statistics/final-october-2025-provisional-november-2025-official-statistics \
-  --enrich
+# Test MCP metadata
+PYTHONPATH=src python -c "
+from scripts.mcp_server import get_schema
+schema = get_schema('tbl_la_smoking_delivery_q1')
+print('Clinical definitions:', list(schema.get('clinical_definitions', {}).keys()))
+"
+
+# Test with Claude MCP
+# Ask: "What is the precise clinical definition of a smoker in the smoking data?"
+# Should answer: "current smokers +/-3 days from labour onset date"
 ```
+
+---
+
+## Key Design Decisions This Session
+
+1. **Temporal Qualifier Rule**: `remove_date_patterns` exists for cross-period consistency (Jan/Feb/Mar → same table). But intra-file qualifiers (Q1/Q2/YTD sheets in same file) must be preserved. Solution: extract from sheet description, re-append after stripping.
+
+2. **Clinical Definitions**: The Notes & Definitions sheets contain gold dust - precise clinical criteria, timing windows, SNOMED codes. These are now extracted and exposed via MCP for chatbot context.
+
+3. **ONS Geography Codes**: NHS hierarchical tables use E-codes (E54=Sub-ICB, E40=Region, E92=National). These are now recognized alongside traditional codes (01A00, Y56).

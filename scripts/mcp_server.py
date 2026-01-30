@@ -148,6 +148,20 @@ def get_schema(table_name: str, schema: str = 'staging') -> Dict:
         metadata['column_mappings'] = sheet_mapping.column_mappings
         metadata['mappings_version'] = sheet_mapping.mappings_version
         metadata['last_enriched'] = sheet_mapping.last_enriched
+        metadata['source_sheet'] = sheet_mapping.sheet_pattern
+
+        # Attach "gold dust" from Notes/Contents sheets
+        if parent_config.file_context:
+            sheet_desc = parent_config.file_context.get('sheets', {}).get(sheet_mapping.sheet_pattern)
+            if sheet_desc:
+                metadata['source_sheet_description'] = sheet_desc
+            # Include KPIs relevant to this data
+            metadata['kpi_definitions'] = parent_config.file_context.get('kpis', {})
+            metadata['methodology'] = parent_config.file_context.get('methodology', '')
+            # Clinical definitions (timing, thresholds, criteria) - the real gold dust
+            metadata['clinical_definitions'] = parent_config.file_context.get('definitions', {})
+            # SNOMED/ICD codes
+            metadata['classification_codes'] = parent_config.file_context.get('codes', {})
 
         for col in metadata.get('columns', []):
             col_name = col['name']
@@ -301,6 +315,12 @@ def get_lineage(table_name: str) -> Dict:
 
     # Include file_context if available (extracted from Notes/Contents sheets)
     file_context = parent_config.file_context if parent_config else None
+
+    # Direct connection: attach sheet description to source (the "gold dust" from Notes sheet)
+    if file_context and source.get('sheet_name'):
+        sheet_desc = file_context.get('sheets', {}).get(source['sheet_name'])
+        if sheet_desc:
+            source['sheet_description'] = sheet_desc
 
     return {
         'table_name': table_name,

@@ -16,7 +16,12 @@ MIN_MATCHES = 3  # Minimum matching values to avoid false positives
 # Primary org column patterns (hierarchical table detection)
 PRIMARY_ORG_COLUMN_PATTERNS = [
     'org code', 'org_code', 'organisation code', 'organization code',
-    'provider code', 'provider_code', 'org id', 'org_id', 'provider id', 'provider_id'
+    'provider code', 'provider_code', 'org id', 'org_id', 'provider id', 'provider_id',
+    # Local authority column patterns
+    'la code', 'local authority code', 'local authority', 'la_code',
+    'geography code', 'geography_code', 'area code', 'area_code', 'ons code', 'ons_code',
+    # Sub-ICB column patterns
+    'sub-icb code', 'sub icb code', 'sub_icb_code', 'sicb code',
 ]
 
 # Values to exclude from entity detection
@@ -34,6 +39,15 @@ ENTITY_PATTERNS = {
         'pattern': r'^Q[A-Z0-9]{2}$', 'description': 'Integrated Care Board level',
         'examples': ['QWE', 'QOP', 'QHG'], 'priority': 100
     },
+    'sub_icb': {
+        # Traditional Sub-ICB codes (01A00) OR ONS geography codes (E54xxxxxx)
+        'pattern': r'^([0-9]{2}[A-Z][A-Z0-9]{1,4}|E54[0-9]{6})$', 'description': 'Sub-ICB location level',
+        'examples': ['01A00', '15E01', 'E54000027'], 'priority': 85
+    },
+    'local_authority': {
+        'pattern': r'^E0[6-9][0-9]{6}$', 'description': 'Local Authority/Borough level',
+        'examples': ['E09000008', 'E06000001', 'E08000003'], 'priority': 90
+    },
     'gp_practice': {
         'pattern': r'^[A-Z][0-9]{5}$', 'description': 'GP Practice level',
         'examples': ['A81001', 'B82001'], 'priority': 100
@@ -43,12 +57,14 @@ ENTITY_PATTERNS = {
         'examples': ['00J', '00K', '01A'], 'priority': 70
     },
     'region': {
-        'pattern': r'^Y[0-9]{2}$', 'description': 'NHS Region level',
-        'examples': ['Y56', 'Y58', 'Y59'], 'priority': 50
+        # Traditional region codes (Y56) OR ONS geography codes (E40xxxxxx)
+        'pattern': r'^(Y[0-9]{2}|E40[0-9]{6})$', 'description': 'NHS Region level',
+        'examples': ['Y56', 'Y58', 'E40000003'], 'priority': 50
     },
     'national': {
-        'pattern': None, 'keywords': ['ENGLAND', 'NATIONAL', 'TOTAL', 'ALL'],
-        'description': 'National aggregate', 'priority': 10
+        # ONS geography code for England national (E92xxxxxx)
+        'pattern': r'^E92[0-9]{6}$', 'keywords': ['ENGLAND', 'NATIONAL', 'TOTAL', 'ALL'],
+        'description': 'National aggregate', 'examples': ['E92000001'], 'priority': 10
     }
 }
 
@@ -61,6 +77,10 @@ NAME_PATTERNS = {
     'icb': {
         'keywords': ['INTEGRATED CARE BOARD', ' ICB'],
         'description': 'Integrated Care Board (by name)', 'priority': 80
+    },
+    'local_authority': {
+        'keywords': ['BOROUGH', 'COUNCIL', 'DISTRICT', 'CITY OF', 'LONDON BOROUGH'],
+        'description': 'Local Authority/Borough (by name)', 'priority': 75
     },
 }
 
@@ -77,7 +97,9 @@ MEASURE_KEYWORDS = [
 ENTITY_KEYWORDS = [
     'code', ' id', 'org', 'provider code', 'trust code', 'icb code', 'region code',
     'practice code', 'commissioner code', 'org name', 'provider name', 'trust name',
-    'geography'
+    'geography',
+    # LA keywords
+    'la code', 'local authority', 'borough', 'council', 'area code', 'sub-icb', 'sicb',
 ]
 
 

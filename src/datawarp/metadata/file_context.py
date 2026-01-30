@@ -19,16 +19,20 @@ class FileContext:
     """Structured context extracted from file metadata sheets."""
     sheets: Dict[str, str] = field(default_factory=dict)   # sheet_name → description
     kpis: Dict[str, str] = field(default_factory=dict)     # kpi_name → definition
+    definitions: Dict[str, str] = field(default_factory=dict)  # measure → precise clinical definition
     methodology: str = ""
     data_sources: List[str] = field(default_factory=list)
+    codes: Dict[str, str] = field(default_factory=dict)    # code → meaning (SNOMED, ICD, etc.)
 
     def to_dict(self) -> dict:
-        return {'sheets': self.sheets, 'kpis': self.kpis, 'methodology': self.methodology, 'data_sources': self.data_sources}
+        return {'sheets': self.sheets, 'kpis': self.kpis, 'definitions': self.definitions,
+                'methodology': self.methodology, 'data_sources': self.data_sources, 'codes': self.codes}
 
     @classmethod
     def from_dict(cls, data: dict) -> 'FileContext':
         return cls(sheets=data.get('sheets', {}), kpis=data.get('kpis', {}),
-                   methodology=data.get('methodology', ''), data_sources=data.get('data_sources', []))
+                   definitions=data.get('definitions', {}), methodology=data.get('methodology', ''),
+                   data_sources=data.get('data_sources', []), codes=data.get('codes', {}))
 
 
 def extract_metadata_text(file_path: str, max_rows: int = 50) -> str:
@@ -89,10 +93,20 @@ def extract_file_context(metadata_text: str, all_sheets: List[str] = None, pipel
     prompt = f"""Extract structured metadata from NHS file documentation.
 {sheets_hint}
 
-{metadata_text[:4000]}
+{metadata_text[:6000]}
+
+Return JSON with these fields:
+- sheets: Map sheet names to their descriptions
+- kpis: High-level KPI names and what they measure
+- definitions: PRECISE clinical definitions (e.g., "smoker = current smoker +/-3 days of delivery", timing, thresholds, inclusion criteria)
+- methodology: Data collection notes, rounding rules, suppression thresholds
+- data_sources: Source datasets (e.g., "MSDS", "HES")
+- codes: Any SNOMED, ICD, or classification codes mentioned with their meanings
+
+IMPORTANT: For definitions, extract the EXACT clinical criteria - timing windows, thresholds, what counts as a "case". These are critical for data interpretation.
 
 Return JSON only:
-{{"sheets": {{"sheet_name": "description"}}, "kpis": {{"metric": "definition"}}, "methodology": "notes", "data_sources": ["source"]}}"""
+{{"sheets": {{}}, "kpis": {{}}, "definitions": {{}}, "methodology": "", "data_sources": [], "codes": {{}}}}"""
 
     start_time = time.time()
     log_data = {'pipeline_id': pipeline_id, 'source_file': source_file, 'sheet_name': '[FILE_CONTEXT]',

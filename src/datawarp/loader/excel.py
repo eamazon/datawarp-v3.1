@@ -41,11 +41,12 @@ def download_file(url: str, target_dir: Optional[str] = None) -> str:
     return local_path
 
 
-def extract_zip(zip_path: str, target_dir: Optional[str] = None) -> List[str]:
+def extract_zip(zip_path: str, target_dir: Optional[str] = None) -> List[Tuple[str, str]]:
     """
     Extract a zip file and return paths to data files inside.
 
-    Returns list of paths to CSV/Excel files found in the zip.
+    Returns list of tuples: (extracted_path, relative_path_in_zip)
+    The relative_path preserves folder structure for provenance tracking.
     """
     if target_dir is None:
         target_dir = tempfile.mkdtemp()
@@ -63,7 +64,9 @@ def extract_zip(zip_path: str, target_dir: Optional[str] = None) -> List[str]:
             if ext in data_extensions:
                 # Extract file
                 zf.extract(name, target_dir)
-                data_files.append(os.path.join(target_dir, name))
+                extracted_path = os.path.join(target_dir, name)
+                # Return both extracted path and relative path within ZIP
+                data_files.append((extracted_path, name))
 
     return data_files
 
@@ -163,7 +166,11 @@ def load_file(
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext == '.csv':
-        df = pd.read_csv(file_path, low_memory=False)
+        try:
+            df = pd.read_csv(file_path, low_memory=False)
+        except pd.errors.ParserError:
+            # Malformed rows (often footers with notes/totals) - silently skip
+            df = pd.read_csv(file_path, low_memory=False, on_bad_lines='skip')
         return load_dataframe(df, table_name, schema, period, column_mappings, sheet_mapping=sheet_mapping)
     elif ext in ['.xlsx', '.xls']:
         # Use FileExtractor for Excel files
