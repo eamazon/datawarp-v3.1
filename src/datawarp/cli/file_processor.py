@@ -54,6 +54,41 @@ from datawarp.loader import (
 from datawarp.metadata import detect_grain, enrich_sheet
 from datawarp.pipeline import SheetMapping, PipelineConfig, record_load, save_config
 from datawarp.utils import sanitize_name, make_table_name
+from datawarp.cli.schema_grouper import get_fingerprint
+
+
+def _process_csv_in_zip(
+    extracted_path: str,
+    relative_path: str,
+    period: str,
+    auto_id: str,
+    enrich: bool,
+    console,
+    name_registry=None,
+    zip_context: str = None,
+) -> List[Tuple[SheetMapping, int]]:
+    """Process a CSV file extracted from a ZIP archive."""
+    try:
+        df = pd.read_csv(extracted_path, low_memory=False)
+    except Exception as e:
+        console.print(f"  [error]Error reading CSV: {e}[/]")
+        return []
+
+    source_rows = len(df)
+    source_columns = len(df.columns)
+    sheet_name = os.path.splitext(os.path.basename(relative_path))[0]
+    source_ctx = zip_context if zip_context else relative_path
+
+    result, rows, _, _ = _enrich_and_load(
+        df, sheet_name, extracted_path, auto_id, period, enrich, console, is_csv=True,
+        name_registry=name_registry, source_context=source_ctx
+    )
+    if result:
+        result._source_rows = source_rows
+        result._source_columns = source_columns
+        result._source_path = source_ctx
+        return [(result, rows)]
+    return []
 
 
 def _enrich_and_load(
@@ -158,10 +193,57 @@ def process_data_file(
         else:
             console.print(f"  Found {len(extracted_tuples)} data files in ZIP")
 
-        for extracted_path, relative_path in extracted_tuples:
+        # Separate CSVs (can group by schema) from others (process individually)
+        csv_tuples = [(p, r) for p, r in extracted_tuples if r.lower().endswith('.csv')]
+        other_tuples = [(p, r) for p, r in extracted_tuples if not r.lower().endswith('.csv')]
+
+        # Group CSVs by schema fingerprint
+        if csv_tuples:
+            from collections import defaultdict
+            schema_groups = defaultdict(list)
+            for extracted_path, relative_path in csv_tuples:
+                fp = get_fingerprint(extracted_path)
+                if fp:
+                    schema_groups[fp].append((extracted_path, relative_path))
+
+            if len(schema_groups) < len(csv_tuples):
+                console.print(f"  [info]Grouped {len(csv_tuples)} CSVs into {len(schema_groups)} schema group(s)[/]")
+
+            for fingerprint, group in schema_groups.items():
+                # Pick representative (first file) for enrichment
+                rep_path, rep_relative = group[0]
+                console.print(f"\n  [bold white]-> {rep_relative}[/] (+ {len(group)-1} similar)")
+                new_zip_context = f"{filename}/{rep_relative}"
+
+                # Process representative
+                rep_results = _process_csv_in_zip(
+                    rep_path, rep_relative, period, auto_id, enrich, console,
+                    name_registry=name_registry, zip_context=new_zip_context
+                )
+                if rep_results:
+                    mapping, rows = rep_results[0]
+                    results.append((mapping, rows))
+
+                    # Load remaining files in group with same mapping
+                    for extracted_path, relative_path in group[1:]:
+                        console.print(f"    [muted]Loading {relative_path}...[/]")
+                        try:
+                            df = pd.read_csv(extracted_path, low_memory=False)
+                            file_rows, _, _ = load_file(
+                                extracted_path, mapping.table_name, period=period,
+                                column_mappings=mapping.column_mappings
+                            )
+                            if file_rows > 0:
+                                console.print(f"    [muted]{file_rows} rows[/]")
+                                # Accumulate source metrics
+                                mapping._source_rows = getattr(mapping, '_source_rows', 0) + len(df)
+                        except Exception as e:
+                            console.print(f"    [error]Error: {e}[/]")
+
+        # Process non-CSV files individually (Excel, nested ZIPs)
+        for extracted_path, relative_path in other_tuples:
             ext_type = os.path.splitext(relative_path)[1].lower().lstrip('.')
             console.print(f"\n  [bold white]-> {relative_path}[/]")
-            # Build ZIP context: "zipfile.zip/folder/file.xlsx"
             new_zip_context = f"{filename}/{relative_path}"
             results.extend(process_data_file(
                 extracted_path, os.path.basename(relative_path), ext_type, period, auto_id, enrich, console,

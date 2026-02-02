@@ -23,6 +23,51 @@ MONTHS = {
 MONTH_PATTERN = '|'.join(sorted(MONTHS.keys(), key=len, reverse=True))
 
 
+def _extract_all_month_years(text: str) -> List[Tuple[str, str]]:
+    """Extract ALL month-year pairs from text, ordered by position.
+
+    Used to detect date ranges like "October 2019 - September 2025".
+    Also handles "Jan-Sep 2025" where multiple months share one year.
+    Returns list of (year, month) tuples.
+    """
+    text_lower = text.lower()
+    results = []
+
+    # Find all month-name + year pairs (e.g., "october 2019", "september 2025")
+    for match in re.finditer(rf'({MONTH_PATTERN})\s*[-_/]?\s*(20[1-3]\d)', text_lower):
+        month_num = MONTHS.get(match.group(1))
+        year = match.group(2)
+        if month_num:
+            results.append((year, month_num, match.start()))
+
+    # Handle "Month1-Month2 Year" pattern (e.g., "Jan-Sep 2025")
+    range_match = re.search(rf'({MONTH_PATTERN})[-–—/\s]+({MONTH_PATTERN})\s+(20[1-3]\d)', text_lower)
+    if range_match:
+        month1 = MONTHS.get(range_match.group(1))
+        month2 = MONTHS.get(range_match.group(2))
+        year = range_match.group(3)
+        if month1 and month2:
+            results.append((year, month1, range_match.start()))
+            results.append((year, month2, range_match.start() + 1))
+
+    # Also check year-month patterns (2025-09)
+    for match in re.finditer(r'(20[1-3]\d)[-_/](\d{2})', text_lower):
+        yr, mo = match.groups()
+        if 1 <= int(mo) <= 12:
+            results.append((yr, mo, match.start()))
+
+    # Sort by position and return without position, deduplicate
+    results.sort(key=lambda x: (x[2], x[1]))
+    seen = set()
+    unique = []
+    for r in results:
+        key = (r[0], r[1])
+        if key not in seen:
+            seen.add(key)
+            unique.append(key)
+    return unique
+
+
 def _extract_month_year(text: str) -> Optional[Tuple[str, str]]:
     """Smart extraction of month and year from text.
 
@@ -118,16 +163,31 @@ def parse_period(text: str) -> Optional[str]:
     - nov25 (abbreviated)
     - q2-2526 (quarterly, UK FY 2025-26 Q2 → 2025-07)
     - q1-25, q3-2025 (quarterly variants)
+    - Date ranges: "October 2019 - September 2025" → returns END date (2025-09)
+    - Year-only: "2020" → returns January (2020-01)
 
     Returns None if no period found.
     """
     if not text:
         return None
 
+    # Check for date range pattern (two or more dates)
+    # For ranges, return the END date (most relevant for cumulative data)
+    all_dates = _extract_all_month_years(text)
+    if len(all_dates) >= 2:
+        year, month = all_dates[-1]  # Last date = end of range
+        return f"{year}-{month}"
+
+    # Try standard single-date extraction
     result = _extract_month_year(text)
     if result:
         year, month = result
         return f"{year}-{month}"
+
+    # Fallback: year-only pattern (e.g., "2020", "data 2020", "data_2023")
+    year_match = re.search(r'(?:^|[\s_-])(20[1-3]\d)(?:[\s_-]|$)', text)
+    if year_match:
+        return f"{year_match.group(1)}-01"  # Default to January
 
     return None
 
@@ -212,3 +272,35 @@ def sort_periods(periods: List[str], descending: bool = True) -> List[str]:
     """Sort periods chronologically."""
     valid = [p for p in periods if p != 'unknown']
     return sorted(valid, reverse=descending)
+
+
+def parse_period_range(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract period range from text.
+
+    Returns (start_period, end_period) tuple. Both are YYYY-MM strings.
+    For single dates, start and end will be the same.
+    For date ranges like "October 2019 - September 2025", returns full span.
+
+    Examples:
+        "October 2019 - September 2025" -> ("2019-10", "2025-09")
+        "December 2025" -> ("2025-12", "2025-12")
+        "2020" -> ("2020-01", "2020-01")
+        "no date here" -> (None, None)
+    """
+    if not text:
+        return (None, None)
+
+    all_dates = _extract_all_month_years(text)
+
+    if len(all_dates) >= 2:
+        start_year, start_month = all_dates[0]
+        end_year, end_month = all_dates[-1]
+        return (f"{start_year}-{start_month}", f"{end_year}-{end_month}")
+
+    # Single date case - use parse_period for consistent handling
+    single = parse_period(text)
+    if single:
+        return (single, single)
+
+    return (None, None)
