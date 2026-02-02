@@ -31,4 +31,5 @@ htmlcov/
 *.tmp
 *.log
 tasks/
+temp/
 docs/mcp/test.json
