@@ -26,6 +26,87 @@ This guide explains how DataWarp captures, enriches, and maintains metadata for 
 
 ---
 
+## Visual Overview: How DataWarp Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     THE DATAWARP PIPELINE AT A GLANCE                            │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    NHS DIGITAL                                                    CLAUDE
+    ───────────                                                    ──────
+         │                                                           ▲
+         │                                                           │
+         ▼                                                           │
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐  │
+│   Landing Page  │────▶│   BOOTSTRAP     │────▶│   PostgreSQL    │──┘
+│                 │     │                 │     │                 │
+│ • Excel files   │     │ • Discover      │     │ • staging.*     │
+│ • CSV files     │     │ • Enrich (LLM)  │     │ • datawarp.*    │
+│ • ZIP archives  │     │ • Load          │     │                 │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+    ┌────────────────────────────────────────────────────┤
+    │                                                    │
+    ▼                                                    ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   New Period    │────▶│     SCAN        │────▶│   Append Data   │
+│   Published     │     │                 │     │   + Period Col  │
+│                 │     │ • Reuse config  │     │                 │
+│ (monthly/qtr)   │     │ • No LLM cost   │     │ 2024-11: 1304   │
+│                 │     │ • Auto-detect   │     │ 2024-12: 1318   │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              COMMAND QUICK REFERENCE                             │
+├─────────────────┬───────────────────────────────────────────────────────────────┤
+│   BOOTSTRAP     │  Initial setup: URL → Discover → Enrich (LLM) → Load → Config │
+│   SCAN          │  Ongoing: Find new periods → Load using saved patterns        │
+│   BACKFILL      │  Historical: Load specific date range                         │
+│   RESET         │  Clear data, preserve enrichment (reload without LLM cost)    │
+│   ENRICH        │  Fill empty descriptions after column drift                   │
+│   LIST/HISTORY  │  View pipelines and load history                              │
+└─────────────────┴───────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          DATA TRANSFORMATION EXAMPLE                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  NHS FILE (adhd_nov25.csv)              AFTER ENRICHMENT                IN DATABASE
+  ─────────────────────────              ────────────────                ───────────
+
+  org_code,measure_1,rpt_dt     →    icb_code,referrals,report_date  →  staging.tbl_adhd_counts
+  QWE,1234,2025-11-01                 (semantic names)                   │ period   │ icb_code │ referrals │
+  QER,5678,2025-11-01                                                    │ 2025-11  │ QWE      │ 1234      │
+  ...                                                                    │ 2025-11  │ QER      │ 5678      │
+
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                             WHY THIS MATTERS                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  WITHOUT DATAWARP                       WITH DATAWARP
+  ────────────────                       ─────────────
+
+  User: "What ADHD data do you have?"    User: "What ADHD data do you have?"
+
+  Claude: "I don't have access to        Claude: "I have access to tbl_adhd_counts
+           any NHS datasets."                     which contains ADHD referrals by
+                                                  ICB (Integrated Care Board).
+
+                                                  Columns include:
+                                                  • icb_code - ICB identifier
+                                                  • referrals_received - count
+                                                  • waiting_time - days waiting
+
+                                                  Data available for:
+                                                  May 2025, Aug 2025, Nov 2025"
+```
+
+---
+
 ## 1. What is Metadata and Why Does it Matter?
 
 ### The Problem
@@ -1391,6 +1472,60 @@ Drop existing tables before re-bootstrap? [Y/n]: y
 - **Collision prevention:** If LLM suggests same table name for different files, auto-generates unique suffix (e.g., `tbl_trust_shmi` → `tbl_trust_shmi_site`)
 - **Source tracking:** Records source_rows and source_path for reconciliation via `v_load_reconciliation`
 
+**Critical Design: DataFrame Columns as Single Source of Truth**
+
+This is the fix for the V3 bug that caused 27,000 lines of code to load zero rows:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      COLUMN NAME FLOW (V3 BUG FIX)                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  V3 BUG (column names generated separately):
+
+    ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+    │ DDL Generator│      │ COPY Command │      │   Database   │
+    │ (columns A)  │      │ (columns B)  │      │  (expects A) │
+    └──────┬───────┘      └──────┬───────┘      └──────────────┘
+           │                     │                     ▲
+           │  "org_code,        │  "organisation_     │  MISMATCH!
+           │   measure_1"       │   code, metric_1"   │  → 0 rows
+           │                     │                     │
+           └─────────────────────┴─────────────────────┘
+
+
+  V3.1 FIX (DataFrame is single source of truth):
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    DataFrame.columns                          │
+    │           ['icb_code', 'referrals', 'period']                │
+    └────────────────────────┬─────────────────────────────────────┘
+                             │
+           ┌─────────────────┼─────────────────┐
+           │                 │                 │
+           ▼                 ▼                 ▼
+    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+    │ CREATE TABLE │  │ COPY FROM    │  │   Database   │
+    │ (icb_code,   │  │ STDIN (      │  │   receives   │
+    │  referrals,  │  │  icb_code,   │  │   matching   │
+    │  period)     │  │  referrals,  │  │   columns    │
+    │              │  │  period)     │  │              │
+    └──────────────┘  └──────────────┘  └──────────────┘
+           │                 │                 │
+           └─────────────────┴─────────────────┘
+                             │
+                      ALL USE df.columns
+                      (cannot drift)
+
+  CODE:
+    # Set columns ONCE
+    df.columns = [sanitize_name(c) for c in df.columns]
+
+    # Both DDL and COPY read from same source
+    ddl = f'CREATE TABLE ({", ".join(df.columns)})'
+    copy = f'COPY ({", ".join(df.columns)}) FROM STDIN'
+```
+
 ---
 
 ### scan
@@ -1806,6 +1941,116 @@ DataWarp uses PostgreSQL with 2 schemas:
 - `datawarp` - Configuration and metadata (4 tables, 5 views)
 - `staging` - Loaded NHS data (dynamic tables)
 
+### Schema Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           DATABASE SCHEMA                                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  datawarp schema (configuration)                 staging schema (data)
+  ───────────────────────────────                 ────────────────────
+
+  ┌─────────────────────────────┐                 ┌─────────────────────────┐
+  │   tbl_pipeline_configs      │                 │    staging.<table>      │
+  │   (PK: pipeline_id)         │                 │    (dynamic tables)     │
+  ├─────────────────────────────┤                 ├─────────────────────────┤
+  │ pipeline_id     VARCHAR     │                 │ period          VARCHAR │
+  │ config          JSONB       │──┐              │ col1            INT     │
+  │ created_at      TIMESTAMP   │  │              │ col2            FLOAT   │
+  │ updated_at      TIMESTAMP   │  │              │ col3            TEXT    │
+  └─────────────────────────────┘  │              │ ...                     │
+           │                       │              └─────────────────────────┘
+           │  config contains:     │                         ▲
+           │  ┌─────────────────┐  │                         │
+           │  │ file_patterns[] │  │                         │
+           │  │ sheet_mappings[]│  │                         │
+           │  │ column_mappings │──┼── defines columns ──────┘
+           │  │ loaded_periods[]│  │
+           │  │ file_context    │  │
+           │  └─────────────────┘  │
+           │                       │
+           ▼                       │
+  ┌─────────────────────────────┐  │
+  │   tbl_load_history          │  │
+  │   (PK: pipeline_id +        │  │
+  │        period + table_name) │  │
+  ├─────────────────────────────┤  │
+  │ pipeline_id     VARCHAR     │◀─┘
+  │ period          VARCHAR     │
+  │ table_name      VARCHAR     │
+  │ sheet_name      VARCHAR     │
+  │ source_file     VARCHAR     │
+  │ rows_loaded     INT         │
+  │ source_rows     INT         │──── for reconciliation
+  │ source_columns  INT         │
+  │ source_path     VARCHAR     │
+  │ loaded_at       TIMESTAMP   │
+  └─────────────────────────────┘
+
+  ┌─────────────────────────────┐
+  │   tbl_enrichment_log        │
+  ├─────────────────────────────┤
+  │ id              SERIAL PK   │
+  │ pipeline_id     VARCHAR     │
+  │ source_file     VARCHAR     │
+  │ sheet_name      VARCHAR     │
+  │ suggested_table VARCHAR     │
+  │ input_tokens    INT         │
+  │ output_tokens   INT         │
+  │ cost_usd        NUMERIC     │
+  │ duration_ms     INT         │
+  │ success         BOOLEAN     │
+  │ error_message   TEXT        │
+  │ created_at      TIMESTAMP   │
+  └─────────────────────────────┘
+
+  ┌─────────────────────────────┐
+  │   tbl_cli_runs              │
+  ├─────────────────────────────┤
+  │ id              SERIAL PK   │
+  │ pipeline_id     VARCHAR     │
+  │ command         VARCHAR     │
+  │ params          JSONB       │
+  │ status          VARCHAR     │
+  │ started_at      TIMESTAMP   │
+  │ ended_at        TIMESTAMP   │
+  └─────────────────────────────┘
+
+
+  VIEWS (extract data from JSONB config)
+  ──────────────────────────────────────
+
+  ┌─────────────────────────────┐     ┌─────────────────────────────┐
+  │   v_table_metadata          │     │   v_column_metadata         │
+  ├─────────────────────────────┤     ├─────────────────────────────┤
+  │ • pipeline_id               │     │ • table_name                │
+  │ • table_name                │     │ • original_name             │
+  │ • table_description         │     │ • semantic_name             │
+  │ • grain                     │     │ • column_description        │
+  │ • grain_column              │     │ • is_enriched (bool)        │
+  │ • mappings_version          │     │ • mappings_version          │
+  │ • last_enriched             │     └─────────────────────────────┘
+  └─────────────────────────────┘
+
+  ┌─────────────────────────────┐     ┌─────────────────────────────┐
+  │   v_table_stats             │     │   v_load_reconciliation     │
+  ├─────────────────────────────┤     ├─────────────────────────────┤
+  │ • table_name                │     │ • table_name                │
+  │ • row_count                 │     │ • period                    │
+  │ • period_count              │     │ • source_rows               │
+  │ • min_period                │     │ • rows_loaded               │
+  │ • max_period                │     │ • reconciliation_status     │
+  └─────────────────────────────┘     │   (match/mismatch/missing)  │
+                                      └─────────────────────────────┘
+  ┌─────────────────────────────┐
+  │   v_tables                  │
+  ├─────────────────────────────┤
+  │ • Combined metadata + stats │
+  │ • Single view for MCP       │
+  └─────────────────────────────┘
+```
+
 ### Core Tables
 
 | Table | Purpose |
@@ -1876,14 +2121,488 @@ FROM staging.your_table;
 
 ## 17. Architecture Overview
 
+### End-to-End Data Flow
+
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              DATA FLOW                                   │
-│                                                                         │
-│   NHS URL → Discovery → Grain Detection → LLM Enrichment → Load → MCP  │
-│                                                                         │
-│   scraper.py   grain.py      enrich.py        excel.py    mcp_server.py│
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          DATAWARP END-TO-END FLOW                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  NHS DIGITAL                    DATAWARP                         POSTGRESQL
+  ───────────                   ────────                         ──────────
+       │                            │                                 │
+       │  ┌───────────────────────────────────────────────────────┐   │
+       │  │                  CLI COMMANDS                          │   │
+       │  │  ┌─────────┐ ┌──────┐ ┌────────┐ ┌───────┐ ┌────────┐ │   │
+       │  │  │bootstrap│ │ scan │ │backfill│ │ reset │ │ enrich │ │   │
+       │  │  └────┬────┘ └──┬───┘ └───┬────┘ └───┬───┘ └───┬────┘ │   │
+       │  └───────┼─────────┼─────────┼──────────┼─────────┼──────┘   │
+       │          │         │         │          │         │          │
+       ▼          ▼         ▼         ▼          │         │          │
+  ┌─────────┐  ┌─────────────────────────┐       │         │          │
+  │ Landing │  │      DISCOVERY          │       │         │          │
+  │  Page   │──│  classifier.py          │       │         │          │
+  │         │  │  scraper.py             │       │         │          │
+  │ - Files │  │  - URL classification   │       │         │          │
+  │ - Links │  │  - File discovery       │       │         │          │
+  │ - Dates │  │  - Period extraction    │       │         │          │
+  └─────────┘  └───────────┬─────────────┘       │         │          │
+                           │                     │         │          │
+                           ▼                     │         │          │
+               ┌───────────────────────┐         │         │          │
+               │      METADATA         │         │         ▼          │
+               │  grain.py             │         │    ┌─────────┐     │
+               │  enrich.py            │◀────────┼────│  LLM    │     │
+               │  file_context.py      │         │    │ (Gemini)│     │
+               │  - Grain detection    │         │    └─────────┘     │
+               │  - LLM enrichment     │         │         │          │
+               │  - Context extraction │         │         │          │
+               └───────────┬───────────┘         │         │          │
+                           │                     │         │          │
+                           ▼                     │         │          │
+               ┌───────────────────────┐         │         │          │
+               │       LOADER          │         │         │          │
+               │  excel.py             │         │         │          │
+               │  - Download files     │         │         │          │
+               │  - Sanitize columns   │         │         │          │
+               │  - Apply mappings     │         │         │          │
+               │  - Load to PostgreSQL │─────────┼─────────┼──────────┼───▶
+               └───────────┬───────────┘         │         │          │
+                           │                     │         │          │
+                           ▼                     ▼         │          │
+               ┌───────────────────────┐  ┌───────────┐    │          ▼
+               │      PIPELINE         │  │  Config   │    │    ┌──────────┐
+               │  config.py            │◀─│  (JSONB)  │────┼───▶│ datawarp │
+               │  repository.py        │  └───────────┘    │    │ schema   │
+               │  - Save/load config   │         ▲         │    ├──────────┤
+               │  - Record history     │         │         │    │ tbl_     │
+               └───────────────────────┘         │         │    │ pipeline │
+                           │                     │         │    │ _configs │
+                           │                     │         │    ├──────────┤
+                           └─────────────────────┘         │    │ tbl_load │
+                                                           │    │ _history │
+                                                           │    ├──────────┤
+               ┌───────────────────────┐                   │    │ tbl_     │
+               │      MCP SERVER       │                   │    │ enrich_  │
+               │  mcp_server.py        │◀──────────────────┘    │ log      │
+               │  - list_datasets      │                        └──────────┘
+               │  - get_schema         │                              │
+               │  - query              │                              │
+               │  - get_lineage        │                              ▼
+               └───────────┬───────────┘                        ┌──────────┐
+                           │                                    │ staging  │
+                           ▼                                    │ schema   │
+               ┌───────────────────────┐                        ├──────────┤
+               │    CLAUDE DESKTOP     │                        │ tbl_*    │
+               │  - Natural language   │◀───────────────────────│ (data)   │
+               │  - Context-aware SQL  │                        └──────────┘
+               │  - Full metadata      │
+               └───────────────────────┘
+```
+
+### Bootstrap Command Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                             BOOTSTRAP FLOW                                       │
+│                     python scripts/pipeline.py bootstrap                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+     --url "https://..."                    --enrich (optional)
+            │                                    │
+            ▼                                    │
+    ┌───────────────────┐                        │
+    │ URL CLASSIFICATION │                       │
+    │ classifier.py      │                       │
+    │ • NHS Digital vs   │                       │
+    │   England          │                       │
+    │ • Discovery mode   │                       │
+    │ • Frequency        │                       │
+    └─────────┬─────────┘                        │
+              │                                  │
+              ▼                                  │
+    ┌───────────────────┐                        │
+    │  FILE DISCOVERY   │                        │
+    │  scraper.py       │                        │
+    │ • Scrape landing  │                        │
+    │   page            │                        │
+    │ • Extract file    │                        │
+    │   URLs            │                        │
+    │ • Detect periods  │                        │
+    └─────────┬─────────┘                        │
+              │                                  │
+              ▼                                  │
+    ┌───────────────────┐                        │
+    │  GROUP BY PERIOD  │                        │
+    │ • 2024-11: 3 files│                        │
+    │ • 2024-12: 3 files│                        │
+    │ User selects      │                        │
+    └─────────┬─────────┘                        │
+              │                                  │
+              ▼                                  │
+    ┌───────────────────┐                        │
+    │  DOWNLOAD FILES   │                        │
+    │  excel.py         │                        │
+    │ • To temp dir     │                        │
+    │ • Separate by     │                        │
+    │   type            │                        │
+    └─────────┬─────────┘                        │
+              │                                  │
+              ├──────────────┬──────────────┐    │
+              ▼              ▼              ▼    │
+    ┌──────────────┐ ┌──────────────┐ ┌─────────┴───┐
+    │  CSV FILES   │ │ EXCEL FILES  │ │  ZIP FILES  │
+    │              │ │              │ │             │
+    │ Group by     │ │ List sheets  │ │ Extract &   │
+    │ schema       │ │              │ │ deduplicate │
+    │ (columns)    │ │ Extract      │ │             │
+    │              │ │ metadata     │ │ Process     │
+    │              │ │ (Notes,      │ │ contents    │
+    │              │ │ Contents)    │ │             │
+    └──────┬───────┘ └──────┬───────┘ └──────┬──────┘
+           │                │                │
+           └────────────────┼────────────────┘
+                            │
+                            ▼
+              ┌─────────────────────────┐
+              │    PER FILE/SHEET       │
+              │    PROCESSING LOOP      │
+              └─────────────┬───────────┘
+                            │
+         ┌──────────────────┴──────────────────┐
+         │                                     │
+         ▼                                     ▼
+┌─────────────────┐                 ┌─────────────────┐
+│ GRAIN DETECTION │                 │ LLM ENRICHMENT  │◀── if --enrich
+│ grain.py        │                 │ enrich.py       │
+│                 │                 │                 │
+│ Pass 1: Primary │                 │ • Build prompt  │
+│   org columns   │                 │ • Call Gemini   │
+│ Pass 2: Entity  │                 │ • Parse response│
+│   detection     │                 │                 │
+│ Pass 3: Name    │                 │ Returns:        │
+│   fallback      │                 │ • table_name    │
+│ Pass 4: National│                 │ • col_mappings  │
+│   keywords      │                 │ • descriptions  │
+│                 │                 │                 │
+│ Returns:        │                 │ Logs to:        │
+│ • grain (icb,   │                 │ tbl_enrichment  │
+│   trust, gp)    │                 │ _log            │
+│ • grain_column  │                 │                 │
+│ • confidence    │                 │                 │
+└────────┬────────┘                 └────────┬────────┘
+         │                                   │
+         └───────────────┬───────────────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │   LOAD TO DATABASE  │
+              │   excel.py          │
+              │                     │
+              │ df.columns = [...]  │◀── SINGLE SOURCE
+              │                     │    OF TRUTH
+              │ CREATE TABLE        │
+              │   staging.<name>    │
+              │   (period, col1,    │
+              │    col2, ...)       │
+              │                     │
+              │ COPY FROM STDIN     │
+              │                     │
+              │ Returns:            │
+              │ • rows_loaded       │
+              │ • col_mappings      │
+              │ • col_types         │
+              └─────────┬───────────┘
+                        │
+                        ▼
+              ┌─────────────────────┐
+              │  SAVE PIPELINE      │
+              │  CONFIG             │
+              │  repository.py      │
+              │                     │
+              │ PipelineConfig:     │
+              │ • pipeline_id       │
+              │ • file_patterns[]   │
+              │ • sheet_mappings[]  │
+              │ • column_mappings   │
+              │ • loaded_periods[]  │
+              │ • file_context      │
+              │                     │
+              │ Stored as JSONB     │
+              │ in tbl_pipeline_    │
+              │ configs             │
+              └─────────────────────┘
+```
+
+### Scan Command Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              SCAN FLOW                                           │
+│                    python scripts/pipeline.py scan                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+     --pipeline mi_adhd
+            │
+            ▼
+    ┌───────────────────┐
+    │ LOAD CONFIG       │
+    │ repository.py     │
+    │                   │
+    │ Retrieve saved:   │
+    │ • file_patterns   │
+    │ • column_mappings │◀── REUSES enrichment (no LLM cost)
+    │ • loaded_periods  │
+    └─────────┬─────────┘
+              │
+              ▼
+    ┌───────────────────────────────────────────────────────┐
+    │                   DISCOVERY MODE                       │
+    ├───────────────────┬───────────────────┬───────────────┤
+    │                   │                   │               │
+    │   TEMPLATE        │    DISCOVER       │   EXPLICIT    │
+    │                   │                   │               │
+    │ Generate URLs     │ Scrape landing    │ Error:        │
+    │ from pattern      │ page              │ URLs must be  │
+    │                   │                   │ added manually│
+    │ HEAD request      │ Extract files     │               │
+    │ each period       │ and periods       │               │
+    │                   │                   │               │
+    │ 200 = exists      │                   │               │
+    │ 404 = not yet     │                   │               │
+    └─────────┬─────────┴─────────┬─────────┴───────────────┘
+              │                   │
+              └─────────┬─────────┘
+                        │
+                        ▼
+              ┌─────────────────────┐
+              │  GROUP BY PERIOD    │
+              │                     │
+              │  Available:         │
+              │  [2024-09, 2024-10, │
+              │   2024-11, 2024-12] │
+              └─────────┬───────────┘
+                        │
+                        ▼
+              ┌─────────────────────┐
+              │  FIND NEW PERIODS   │
+              │                     │
+              │  loaded_periods:    │
+              │  [2024-09, 2024-10] │
+              │                     │
+              │  new_periods:       │
+              │  [2024-11, 2024-12] │
+              │                     │
+              │  + refresh recent 2:│
+              │  [2024-10, 2024-11] │◀── Provisional → Final
+              └─────────┬───────────┘
+                        │
+                        ▼
+              ┌─────────────────────────────────────────┐
+              │          LOAD EACH PERIOD               │
+              │                                         │
+              │  For each period:                       │
+              │  ┌─────────────────────────────────┐    │
+              │  │ 1. Download files               │    │
+              │  │ 2. Match against file_patterns  │    │
+              │  │ 3. Apply saved sheet_mappings   │    │
+              │  │ 4. Apply saved column_mappings  │    │
+              │  │ 5. Load to staging tables       │    │
+              │  │ 6. Detect column drift          │    │
+              │  │ 7. Record in tbl_load_history   │    │
+              │  └─────────────────────────────────┘    │
+              │                                         │
+              │  Drift detected?                        │
+              │  ├── Yes: Add identity mappings         │
+              │  │        (empty descriptions)          │
+              │  │        Bump mappings_version         │
+              │  │        → Run 'enrich' later          │
+              │  │                                      │
+              │  └── No: Continue normally              │
+              └─────────────────┬───────────────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────────────┐
+              │          UPDATE CONFIG                  │
+              │                                         │
+              │  config.loaded_periods.extend([         │
+              │    '2024-11', '2024-12'                 │
+              │  ])                                     │
+              │                                         │
+              │  save_config(config)                    │
+              └─────────────────────────────────────────┘
+```
+
+### Reset + Reload Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         RESET + RELOAD WORKFLOW                                  │
+│          Reload data without LLM costs (preserves enrichment)                    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  BEFORE RESET                          AFTER RESET
+  ────────────                          ───────────
+
+  datawarp.tbl_pipeline_configs         datawarp.tbl_pipeline_configs
+  ┌─────────────────────────┐           ┌─────────────────────────┐
+  │ pipeline_id: mi_adhd    │           │ pipeline_id: mi_adhd    │
+  │ file_patterns: [...]    │           │ file_patterns: [...]    │ ◀── PRESERVED
+  │ column_mappings: {...}  │ ─────────▶│ column_mappings: {...}  │ ◀── PRESERVED
+  │ column_descriptions: {} │           │ column_descriptions: {} │ ◀── PRESERVED
+  │ loaded_periods:         │           │ loaded_periods: []      │ ◀── CLEARED
+  │   [2024-09, 2024-10,    │           │                         │
+  │    2024-11, 2024-12]    │           │                         │
+  └─────────────────────────┘           └─────────────────────────┘
+
+  staging.tbl_adhd_counts               staging.tbl_adhd_counts
+  ┌─────────────────────────┐           ┌─────────────────────────┐
+  │ period   │ icb_code │.. │           │       (DROPPED)         │
+  │──────────┼──────────┼───│ ─────────▶│                         │
+  │ 2024-09  │ QWE      │.. │           │                         │
+  │ 2024-10  │ QWE      │.. │           │                         │
+  │ 2024-11  │ QWE      │.. │           │                         │
+  │ 10,771 rows              │           │                         │
+  └─────────────────────────┘           └─────────────────────────┘
+
+  datawarp.tbl_load_history             datawarp.tbl_load_history
+  ┌─────────────────────────┐           ┌─────────────────────────┐
+  │ pipeline_id │ period    │           │       (CLEARED)         │
+  │─────────────┼───────────│ ─────────▶│                         │
+  │ mi_adhd     │ 2024-09   │           │                         │
+  │ mi_adhd     │ 2024-10   │           │                         │
+  │ mi_adhd     │ 2024-11   │           │                         │
+  └─────────────────────────┘           └─────────────────────────┘
+
+            ┌─────────────────────────────────────────┐
+            │                                         │
+            │              THEN: SCAN                 │
+            │                                         │
+            │  python scripts/pipeline.py scan \     │
+            │    --pipeline mi_adhd                   │
+            │                                         │
+            │  • Uses preserved column_mappings       │
+            │  • Uses preserved file_patterns         │
+            │  • loaded_periods = [] means            │
+            │    ALL periods are "new"                │
+            │  • Reloads everything                   │
+            │                                         │
+            │  NO LLM CALLS ($$$ saved)               │
+            │                                         │
+            └─────────────────────────────────────────┘
+
+  RESET WITHOUT --delete                RESET WITH --delete
+  ──────────────────────                ───────────────────
+
+  ┌────────────────────┐                ┌────────────────────┐
+  │ PRESERVES:         │                │ REMOVES:           │
+  │ • table_name       │                │ • Everything       │
+  │ • column_mappings  │                │ • Pipeline config  │
+  │ • descriptions     │                │ • Enrichment logs  │
+  │ • file_patterns    │                │ • CLI run history  │
+  │ • file_context     │                │ • Staging tables   │
+  │                    │                │                    │
+  │ CLEARS:            │                │ Use when:          │
+  │ • loaded_periods   │                │ Starting fresh     │
+  │ • staging tables   │                │ with new bootstrap │
+  │ • load history     │                │                    │
+  └────────────────────┘                └────────────────────┘
+```
+
+### MCP Server Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          MCP SERVER DATA FLOW                                    │
+│                      How Claude accesses NHS data                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    USER                 CLAUDE DESKTOP              MCP SERVER              DATABASE
+    ────                 ──────────────              ──────────              ────────
+      │                        │                          │                      │
+      │ "What NHS data        │                          │                      │
+      │  do you have?"        │                          │                      │
+      │───────────────────────▶                          │                      │
+      │                        │   list_datasets()       │                      │
+      │                        │─────────────────────────▶                      │
+      │                        │                          │  SELECT * FROM      │
+      │                        │                          │  v_table_metadata   │
+      │                        │                          │─────────────────────▶
+      │                        │                          │                      │
+      │                        │                          │  [{name, desc,      │◀┐
+      │                        │                          │    grain, rows}]    │ │
+      │                        │                          │◀─────────────────────│
+      │                        │  [{tbl_adhd_counts,     │                      │
+      │                        │    "ADHD referrals",    │                      │
+      │                        │    grain: "icb", ...}]  │                      │
+      │                        │◀─────────────────────────│                      │
+      │                        │                          │                      │
+      │ "3 tables available:  │                          │                      │
+      │  tbl_adhd_counts..."  │                          │                      │
+      │◀───────────────────────│                          │                      │
+      │                        │                          │                      │
+      │ "Show referrals       │                          │                      │
+      │  by ICB for Nov 2025" │                          │                      │
+      │───────────────────────▶                          │                      │
+      │                        │   get_schema()          │                      │
+      │                        │─────────────────────────▶                      │
+      │                        │                          │  Get config for     │
+      │                        │                          │  table              │
+      │                        │                          │─────────────────────▶
+      │                        │                          │                      │
+      │                        │   {columns: [...],      │  {column_mappings,  │
+      │                        │    descriptions: {...}, │   descriptions,     │
+      │                        │    kpi_definitions,     │   file_context}     │
+      │                        │    methodology}         │◀─────────────────────│
+      │                        │◀─────────────────────────│                      │
+      │                        │                          │                      │
+      │                        │   query("SELECT        │                      │
+      │                        │     icb_code,          │                      │
+      │                        │     SUM(referrals)     │                      │
+      │                        │   FROM staging.tbl_... │                      │
+      │                        │   WHERE period='2025-11'│                      │
+      │                        │   GROUP BY icb_code")  │                      │
+      │                        │─────────────────────────▶                      │
+      │                        │                          │  Execute SELECT     │
+      │                        │                          │─────────────────────▶
+      │                        │                          │                      │
+      │                        │   {rows: [...],         │  Results            │
+      │                        │    columns: [...]}      │◀─────────────────────│
+      │                        │◀─────────────────────────│                      │
+      │                        │                          │                      │
+      │ [Formatted table      │                          │                      │
+      │  with ICB referrals]  │                          │                      │
+      │◀───────────────────────│                          │                      │
+      │                        │                          │                      │
+
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                    WHAT CLAUDE RECEIVES                              │
+    │                                                                      │
+    │  From get_schema():                                                  │
+    │  ┌────────────────────────────────────────────────────────────────┐ │
+    │  │ table_name: tbl_adhd_counts                                    │ │
+    │  │ description: "ADHD referrals by Integrated Care Board"         │ │
+    │  │ grain: "icb" (Integrated Care Board level)                     │ │
+    │  │                                                                │ │
+    │  │ columns:                                                       │ │
+    │  │   icb_code:                                                    │ │
+    │  │     original: org_code                                         │ │
+    │  │     description: "ICB organisation code (e.g., QWE)"           │ │
+    │  │   referrals_received:                                          │ │
+    │  │     original: measure_1                                        │ │
+    │  │     description: "Number of referrals received in period"      │ │
+    │  │                                                                │ │
+    │  │ file_context:                                                  │ │
+    │  │   kpi_definitions:                                             │ │
+    │  │     wait_4_weeks: "% waiting 4+ weeks from referral"           │ │
+    │  │   methodology: "Data from MHSDS submissions..."                │ │
+    │  │   clinical_definitions:                                        │ │
+    │  │     referral: "Initial contact record with mental health..."   │ │
+    │  └────────────────────────────────────────────────────────────────┘ │
+    │                                                                      │
+    │  → Claude can write context-aware SQL with clinical understanding   │
+    └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Summary
