@@ -1,51 +1,54 @@
 # Current Tasks - DataWarp v3.1
 
-**Last Updated:** 2025-01-30 Session End
+**Last Updated:** 2026-02-02 Session End
 
 ---
 
-## Session Summary (2025-01-30)
+## Session Summary (2026-02-02)
 
 ### Completed This Session
 
-1. **ONS Geography Code Detection** - Expanded grain detection for NHS hierarchical tables
-   - Added E54xxxxxx pattern for Sub-ICB ONS codes
-   - Added E40xxxxxx pattern for NHS Region ONS codes
-   - Added E92xxxxxx pattern for National (England) codes
-   - Tables 2a/2b/3 now correctly detected as `sub_icb` (were `national`)
+1. **Enhanced Period Detection for Date Ranges**
+   - Problem: Files like "Referrals October 2019 - September 2025" returned `2019-10` (first date)
+   - Solution: `parse_period()` now returns END date for ranges → `2025-09`
+   - Files with cumulative data now group correctly by their most relevant period
 
-2. **Intra-File Temporal Qualifier Preservation** - Fixed table naming for Q1/Q2/YTD sheets
-   - Problem: `remove_date_patterns` was stripping Q1/Q2/YTD from table names
-   - Solution: Added `extract_temporal_qualifier()` to preserve intra-file distinctions
-   - Result: `tbl_subicb_smoking_q1`, `tbl_subicb_smoking_q2`, `tbl_subicb_smoking_ytd`
-   - No more ugly `_alt` and `_alt_1` collision-resolved names
+2. **Year-Only Period Detection**
+   - Problem: Files like "eRS dashboard data 2020" returned `None`
+   - Solution: Year-only patterns now return January of that year → `2020-01`
+   - Added `parse_period_range()` function returning `(start, end)` tuple for future use
 
-3. **Enhanced Notes Sheet Metadata Extraction** - Gold dust from Notes & Definitions
-   - Added `definitions` field for precise clinical criteria
-   - Added `codes` field for SNOMED/ICD codes
-   - Enhanced prompt to extract timing windows, thresholds, inclusion criteria
-   - Now captures: "current smokers +/-3 days from labour onset date"
+3. **Schema Grouping for CSVs Inside ZIP Archives**
+   - Problem: `referrals_csv_files.zip` with 72 CSVs created 72 separate tables
+   - Solution: Added schema fingerprinting for ZIP contents
+   - Files with same column structure now load to single table
+   - Result: 72 CSVs → 1 table with ~3M rows
 
-4. **MCP Metadata Enrichment** - Direct attachment of sheet metadata
-   - `get_schema` now includes: `source_sheet_description`, `clinical_definitions`, `classification_codes`
-   - `get_lineage` now includes: `source.sheet_description`
-   - Chatbots get full context without manual lookups
+4. **Comprehensive Period Detection Tests**
+   - Added `tests/test_period.py` with 20 test cases
+   - Covers existing behavior, date ranges, year-only, quarterly patterns
+   - Includes real NHS e-Referral Service filename tests
 
 ### Files Changed
 
 ```
 Modified:
-- src/datawarp/metadata/grain.py (ONS geography patterns)
-- src/datawarp/metadata/canonicalize.py (extract_temporal_qualifier)
-- src/datawarp/metadata/enrich.py (preserve temporal qualifiers)
-- src/datawarp/metadata/file_context.py (definitions, codes fields)
-- scripts/mcp_server.py (clinical_definitions, classification_codes)
-- tests/test_grain_detection.py (ONS geography tests)
+- src/datawarp/utils/period.py (date range + year-only detection)
+- src/datawarp/utils/__init__.py (export parse_period_range)
+- src/datawarp/cli/file_processor.py (ZIP schema grouping)
+- .gitignore (added temp/)
+
+Added:
+- tests/test_period.py (20 new tests)
 ```
 
 ### Tests Added
 
-- `TestONSGeographyCodes` - 3 tests for E54/E40/E92 code detection
+- `TestParsePeriodExisting` - 7 tests (existing behavior verification)
+- `TestParsePeriodDateRanges` - 3 tests (date range handling)
+- `TestParsePeriodYearOnly` - 2 tests (year-only patterns)
+- `TestParsePeriodRange` - 4 tests (new range function)
+- `TestNHSeReferralFilenames` - 4 tests (real NHS filenames)
 
 ---
 
@@ -54,22 +57,39 @@ Modified:
 | Component | Status |
 |-----------|--------|
 | Discovery | ✅ Working |
-| Period Detection | ✅ Working (quarterly support) |
+| Period Detection | ✅ Working (date ranges, year-only, quarterly) |
 | Grain Detection | ✅ Working (ONS codes, LA, Sub-ICB) |
 | LLM Enrichment | ✅ Working (temporal qualifiers preserved) |
 | Notes Extraction | ✅ Working (clinical definitions, codes) |
 | MCP Metadata | ✅ Working (full context attached) |
 | Data Loading | ✅ Working |
+| ZIP Schema Grouping | ✅ Working (CSVs grouped by fingerprint) |
 
 ---
 
-## Pending: Multi-Period File Pattern Matching
+## Known Issues / Pending
 
-### Problem
-When bootstrapping 6 files (3 Oct + 3 Nov with same schemas), creates 6 tables instead of 3.
+### 1. Landing Page Scraper Missing 2020+ Periods (Some Publications)
 
-### Recommended Solution
-Deterministic filename grouping before LLM enrichment - see previous session notes.
+**Observed with:** Women's Smoking Status at Time of Delivery publication
+
+**Problem:**
+- Landing page scraper finds only 2015-2019 files (56 files)
+- 2020-2025 files exist on sub-pages but aren't discovered
+- URL pattern mismatch: classifier expects `/january-2025` but publication uses `/-q2-2025-26`
+
+**Workaround:** Use period-specific URL directly:
+```bash
+python scripts/pipeline.py bootstrap \
+  --url "https://.../-q2-2025-26/data-tables" \
+  --id smoking-delivery --enrich
+```
+
+**Root cause:** `src/datawarp/discovery/scraper.py` - sub-page traversal or URL pattern detection
+
+### 2. Uncommitted DATAWARP_GUIDE.md Changes
+
+There are 735 lines of additions (visual overview diagrams) in `docs/mcp/DATAWARP_GUIDE.md` that were not committed. Review and commit if desired.
 
 ---
 
@@ -80,27 +100,31 @@ cd /Users/speddi/projectx/datawarp-v3.1
 source .venv/bin/activate
 git status
 
-# Verify grain detection
-PYTHONPATH=src python -m pytest tests/test_grain_detection.py -v
+# Run all tests
+PYTHONPATH=src python -m pytest tests/ -v
 
-# Test MCP metadata
+# Test period detection
 PYTHONPATH=src python -c "
-from scripts.mcp_server import get_schema
-schema = get_schema('tbl_la_smoking_delivery_q1')
-print('Clinical definitions:', list(schema.get('clinical_definitions', {}).keys()))
+from datawarp.utils.period import parse_period, parse_period_range
+print(parse_period('October 2019 - September 2025'))  # 2025-09
+print(parse_period('eRS dashboard data 2020'))         # 2020-01
+print(parse_period_range('October 2019 - September 2025'))  # ('2019-10', '2025-09')
 "
 
-# Test with Claude MCP
-# Ask: "What is the precise clinical definition of a smoker in the smoking data?"
-# Should answer: "current smokers +/-3 days from labour onset date"
+# Test bootstrap with NHS e-Referral (has 72 CSVs in ZIP)
+python scripts/pipeline.py bootstrap \
+  --url "https://digital.nhs.uk/data-and-information/publications/statistical/mi-nhs-e-referral-service-open-data/current/data-tables" \
+  --id e-referral --enrich
 ```
 
 ---
 
 ## Key Design Decisions This Session
 
-1. **Temporal Qualifier Rule**: `remove_date_patterns` exists for cross-period consistency (Jan/Feb/Mar → same table). But intra-file qualifiers (Q1/Q2/YTD sheets in same file) must be preserved. Solution: extract from sheet description, re-append after stripping.
+1. **Date Range → End Date**: For cumulative NHS files spanning ranges, the END date is most relevant for grouping (represents latest data coverage).
 
-2. **Clinical Definitions**: The Notes & Definitions sheets contain gold dust - precise clinical criteria, timing windows, SNOMED codes. These are now extracted and exposed via MCP for chatbot context.
+2. **Year-Only → January**: Files with only a year default to January (`2020` → `2020-01`), a sensible convention for annual data.
 
-3. **ONS Geography Codes**: NHS hierarchical tables use E-codes (E54=Sub-ICB, E40=Region, E92=National). These are now recognized alongside traditional codes (01A00, Y56).
+3. **ZIP Schema Grouping**: CSVs inside ZIP archives are now fingerprinted by column structure. Same schema = same table. This matches the existing behavior for top-level CSVs.
+
+4. **Backward Compatibility**: All changes preserve existing behavior - callers of `parse_period()` don't need modification.
