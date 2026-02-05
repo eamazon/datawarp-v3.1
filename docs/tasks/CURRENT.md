@@ -1,54 +1,53 @@
 # Current Tasks - DataWarp v3.1
 
-**Last Updated:** 2026-02-02 Session End
+**Last Updated:** 2026-02-05 Session End
 
 ---
 
-## Session Summary (2026-02-02)
+## Session Summary (2026-02-05)
 
 ### Completed This Session
 
-1. **Enhanced Period Detection for Date Ranges**
-   - Problem: Files like "Referrals October 2019 - September 2025" returned `2019-10` (first date)
-   - Solution: `parse_period()` now returns END date for ranges → `2025-09`
-   - Files with cumulative data now group correctly by their most relevant period
+1. **Created Comprehensive Architecture & Technical Reference**
+   - Created `docs/ARCHITECTURE.md` (2,194 lines) — the definitive document for understanding, maintaining, and extending DataWarp v3.1
+   - Covers: System Overview, Architecture Deep Dive, Module Reference (all function signatures), Integration & Extension Guide
+   - For both humans and coding agents — serves as feeder document for v3.2 integration
+   - Includes: package map, data model, all algorithms (grain detection, period detection, enrichment), MCP server, observability
+   - Full module reference with import paths, parameters, and return types for every public API
 
-2. **Year-Only Period Detection**
-   - Problem: Files like "eRS dashboard data 2020" returned `None`
-   - Solution: Year-only patterns now return January of that year → `2020-01`
-   - Added `parse_period_range()` function returning `(start, end)` tuple for future use
+2. **Archive Documentation Audit & Cleanup**
+   - Examined all 10 files in `docs/archive/` (4,204 lines total)
+   - Examined 3 files in `docs/goagent/` (3,379 lines) — v3.2 chatbot design docs
+   - **Absorbed** 4 files into ARCHITECTURE.md:
+     - `DATAWARP_OBJECT_MAPPING.md` → Python→SQL lifecycle diagram added to Section 2.2
+     - `MCP_PROMPT.md` → Concrete MCP tool output examples added to Section 2.11
+     - `DATAWARP_TESTING_SPEC.md` → V3 regression table + testing framework added to Section 4.7
+     - `CLAUDE_AGENT_TESTING.md` → 6 SQL validation suites + remediation guide added to Section 4.7
+   - **Deleted** 2 superseded files:
+     - `docs/archive/ARCHITECTURE.md` (297 lines) — fully replaced by new docs/ARCHITECTURE.md
+     - `docs/archive/DATAWARP_V3.1_COMPLETE_SPEC.md` (711 lines) — fully replaced
+   - **Retained** 6 files with ongoing reference value:
+     - `DATABASE_SPEC.md`, `GRAIN_DETECTION_DESIGN.md`, `GRAIN_DETECTION_V3_ANALYSIS.md`, `USER_GUIDE.md`
+     - `DATAWARP_OBJECT_MAPPING.md`, `DATAWARP_TESTING_SPEC.md`, `CLAUDE_AGENT_TESTING.md`, `MCP_PROMPT.md`
 
-3. **Schema Grouping for CSVs Inside ZIP Archives**
-   - Problem: `referrals_csv_files.zip` with 72 CSVs created 72 separate tables
-   - Solution: Added schema fingerprinting for ZIP contents
-   - Files with same column structure now load to single table
-   - Result: 72 CSVs → 1 table with ~3M rows
-
-4. **Comprehensive Period Detection Tests**
-   - Added `tests/test_period.py` with 20 test cases
-   - Covers existing behavior, date ranges, year-only, quarterly patterns
-   - Includes real NHS e-Referral Service filename tests
+3. **Updated CLAUDE.md**
+   - Added reference to ARCHITECTURE.md in Documentation Structure section
+   - Clarified role of each document: ARCHITECTURE.md for internals, DATAWARP_GUIDE.md for operations, goagent/ for v3.2
 
 ### Files Changed
 
 ```
+Created:
+- docs/ARCHITECTURE.md (2,194 lines — comprehensive architecture & technical reference)
+
 Modified:
-- src/datawarp/utils/period.py (date range + year-only detection)
-- src/datawarp/utils/__init__.py (export parse_period_range)
-- src/datawarp/cli/file_processor.py (ZIP schema grouping)
-- .gitignore (added temp/)
+- CLAUDE.md (updated Documentation Structure section)
+- docs/tasks/CURRENT.md (this file)
 
-Added:
-- tests/test_period.py (20 new tests)
+Deleted:
+- docs/archive/ARCHITECTURE.md (superseded)
+- docs/archive/DATAWARP_V3.1_COMPLETE_SPEC.md (superseded)
 ```
-
-### Tests Added
-
-- `TestParsePeriodExisting` - 7 tests (existing behavior verification)
-- `TestParsePeriodDateRanges` - 3 tests (date range handling)
-- `TestParsePeriodYearOnly` - 2 tests (year-only patterns)
-- `TestParsePeriodRange` - 4 tests (new range function)
-- `TestNHSeReferralFilenames` - 4 tests (real NHS filenames)
 
 ---
 
@@ -64,6 +63,19 @@ Added:
 | MCP Metadata | ✅ Working (full context attached) |
 | Data Loading | ✅ Working |
 | ZIP Schema Grouping | ✅ Working (CSVs grouped by fingerprint) |
+| Documentation | ✅ Comprehensive (ARCHITECTURE.md + DATAWARP_GUIDE.md) |
+
+---
+
+## Documentation Map
+
+| Document | Purpose | Lines |
+|----------|---------|-------|
+| `docs/ARCHITECTURE.md` | Architecture, internals, module API, integration guide | 2,194 |
+| `docs/mcp/DATAWARP_GUIDE.md` | Operational guide (CLI, SQL, MCP, visual diagrams) | 2,627 |
+| `CLAUDE.md` | Session workflow, coding rules, quick reference | ~200 |
+| `docs/goagent/` | v3.2 chatbot design (README, DESIGN_PLAN, TECHNICAL_SPEC) | 3,379 |
+| `docs/archive/` | 8 historical design docs (retained for reference) | ~2,800 |
 
 ---
 
@@ -87,10 +99,6 @@ python scripts/pipeline.py bootstrap \
 
 **Root cause:** `src/datawarp/discovery/scraper.py` - sub-page traversal or URL pattern detection
 
-### 2. Uncommitted DATAWARP_GUIDE.md Changes
-
-There are 735 lines of additions (visual overview diagrams) in `docs/mcp/DATAWARP_GUIDE.md` that were not committed. Review and commit if desired.
-
 ---
 
 ## Quick Start Next Session
@@ -103,13 +111,9 @@ git status
 # Run all tests
 PYTHONPATH=src python -m pytest tests/ -v
 
-# Test period detection
-PYTHONPATH=src python -c "
-from datawarp.utils.period import parse_period, parse_period_range
-print(parse_period('October 2019 - September 2025'))  # 2025-09
-print(parse_period('eRS dashboard data 2020'))         # 2020-01
-print(parse_period_range('October 2019 - September 2025'))  # ('2019-10', '2025-09')
-"
+# Key documentation
+cat docs/ARCHITECTURE.md   # Architecture & technical reference (2,194 lines)
+cat docs/mcp/DATAWARP_GUIDE.md  # Operational guide (2,627 lines)
 
 # Test bootstrap with NHS e-Referral (has 72 CSVs in ZIP)
 python scripts/pipeline.py bootstrap \
@@ -119,12 +123,12 @@ python scripts/pipeline.py bootstrap \
 
 ---
 
-## Key Design Decisions This Session
+## Ready for v3.2 Integration
 
-1. **Date Range → End Date**: For cumulative NHS files spanning ranges, the END date is most relevant for grouping (represents latest data coverage).
+The documentation is now comprehensive and integration-ready:
 
-2. **Year-Only → January**: Files with only a year default to January (`2020` → `2020-01`), a sensible convention for annual data.
+1. **`docs/ARCHITECTURE.md` Section 4.1** — Specific integration points for the v3.2 chatbot
+2. **`docs/goagent/DESIGN_PLAN.md`** — Product spec with multi-LLM strategy, UI mockups
+3. **`docs/goagent/TECHNICAL_SPEC.md`** — Implementation guide with working code examples
 
-3. **ZIP Schema Grouping**: CSVs inside ZIP archives are now fingerprinted by column structure. Same schema = same table. This matches the existing behavior for top-level CSVs.
-
-4. **Backward Compatibility**: All changes preserve existing behavior - callers of `parse_period()` don't need modification.
+All APIs, data structures, and extension patterns are documented with import paths and examples.

@@ -38,7 +38,7 @@
 - `list` - Show pipelines
 - `history --pipeline <ID>` - Show load history
 
-**Full CLI reference:** `docs/mcp/DATAWARP_GUIDE.md` (Section 14)
+**Full CLI reference:** `docs/mcp/DATAWARP_GUIDE.md` Section 14 | **Architecture:** `docs/ARCHITECTURE.md`
 
 ---
 
@@ -94,7 +94,7 @@ staging.<table_name>    -- Dynamic tables with period column
 | Source row reconciliation | `v_load_reconciliation` compares source vs loaded rows |
 | CSV/XLSX deduplication | ZIP files deduplicated, XLSX preferred over CSV |
 
-**Full guide:** `docs/mcp/DATAWARP_GUIDE.md`
+**Full guide:** `docs/ARCHITECTURE.md` Section 1.6 | `docs/mcp/DATAWARP_GUIDE.md`
 
 ---
 
@@ -162,18 +162,29 @@ PYTHONPATH=src python scripts/mcp_server.py --test
 
 ---
 
-## Documentation Structure
+## Core Documentation
 
-```
-docs/
-├── mcp/
-│   └── DATAWARP_GUIDE.md   # Complete guide (CLI, schema, SQL, architecture)
-├── tasks/
-│   └── CURRENT.md          # Active work tracking
-└── archive/                # Historical design docs (reference only)
-```
+| Document | Lines | What It Covers |
+|----------|-------|----------------|
+| `docs/ARCHITECTURE.md` | 2,194 | **How DataWarp works internally** — code architecture, algorithms, data model, module API (all function signatures with import paths), integration & extension guide |
+| `docs/mcp/DATAWARP_GUIDE.md` | 2,627 | **How to use DataWarp** — CLI commands, SQL verification queries, MCP setup, visual ASCII flow diagrams, troubleshooting |
+| `CLAUDE.md` | this file | Session workflow, coding rules, quick reference, red flags |
 
-**Main reference:** `docs/mcp/DATAWARP_GUIDE.md` - covers CLI commands, database schema, SQL verification queries, and architecture.
+### v3.2 Integration Docs (design phase, untracked)
+
+| Document | Lines | What It Covers |
+|----------|-------|----------------|
+| `docs/goagent/README.md` | 186 | v3.2 roadmap, 10-week plan, 6 phases |
+| `docs/goagent/DESIGN_PLAN.md` | 1,408 | Product spec — multi-LLM strategy, UI mockups, chatbot DB schema |
+| `docs/goagent/TECHNICAL_SPEC.md` | 1,785 | Implementation guide — working code examples, query router, Docker |
+
+### Other
+
+| Location | Purpose |
+|----------|---------|
+| `docs/tasks/CURRENT.md` | Active work tracking, session summaries |
+| `docs/archive/` (8 files) | Historical design docs — retained for reference, valuable content absorbed into ARCHITECTURE.md |
+| `sql/schema.sql` | Database DDL — single source of truth for all tables, views, indexes |
 
 ---
 
